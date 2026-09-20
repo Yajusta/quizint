@@ -1,0 +1,27 @@
+# Stage 1: Vite build — Stage 2: caddy:2-alpine with dist + Caddyfile
+# All workspace manifests are copied so the lockfile is complete for --frozen-lockfile;
+# `--filter @quiz/web...` limits what actually gets installed.
+FROM node:22-alpine AS build
+WORKDIR /app
+RUN corepack enable
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+RUN pnpm install --frozen-lockfile --filter @quiz/web...
+COPY packages/shared packages/shared
+COPY apps/web apps/web
+RUN pnpm --filter @quiz/web build
+
+# Stays root, unlike the API image: caddy:2-alpine declares /data and /config as volumes, so a
+# `chown` in a derived layer is discarded at build time and an unprivileged Caddy could no longer
+# write the ACME certificates it stores under /data. Moving the store elsewhere would mean
+# retargeting XDG_DATA_HOME and the compose volumes — out of scope for a lint finding.
+# checkov:skip=CKV_DOCKER_3: Caddy needs to own its /data volume; see the note above.
+FROM caddy:2-alpine
+COPY --from=build /app/apps/web/dist /srv/web
+COPY deploy/Caddyfile /etc/caddy/Caddyfile
+EXPOSE 80 443
+# Caddy's admin API (localhost:2019) answers as soon as the config is loaded and served.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]

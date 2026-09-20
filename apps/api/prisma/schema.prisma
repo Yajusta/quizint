@@ -1,0 +1,178 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Admin {
+  id            String        @id @default(uuid())
+  email         String        @unique
+  passwordHash  String
+  displayName   String
+  isActive      Boolean       @default(true)
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  quizzes       Quiz[]
+  sessions      LiveSession[]
+  refreshTokens RefreshToken[]
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid())
+  adminId   String
+  admin     Admin     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique // sha256 of the opaque token
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([adminId])
+}
+
+model Quiz {
+  id          String        @id @default(uuid())
+  ownerId     String
+  owner       Admin         @relation(fields: [ownerId], references: [id])
+  title       String
+  description String?
+  settings    Json // QuizSettings (§3.3)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  archivedAt  DateTime? // hidden from the library, restorable; only an archived quiz can be deleted
+  questions   Question[]
+  sessions    LiveSession[]
+
+  @@index([ownerId])
+}
+
+model Question {
+  id                  String   @id @default(uuid())
+  quizId              String
+  quiz                Quiz     @relation(fields: [quizId], references: [id], onDelete: Cascade)
+  position            Int // 0-based, unique per quiz
+  type                String
+  prompt              String // ≤ 500 chars
+  mediaId             String?
+  media               Media?   @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+  mediaOnParticipants Boolean  @default(true)
+  pointsCorrect       Int      @default(100)
+  pointsWrong         Int      @default(0) // may be negative
+  timeLimitSec        Int? // null = no timer; 5..300
+  speedBonusMax       Int      @default(0) // 0 = no bonus; requires timeLimitSec
+  numericAnswer       Json? // NumericAnswerSpec if type = NUMERIC
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  choices             Choice[]
+  answers             Answer[]
+
+  @@unique([quizId, position])
+}
+
+model Choice {
+  id         String   @id @default(uuid())
+  questionId String
+  question   Question @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  position   Int // 0-based
+  label      String // ≤ 120 chars
+  mediaId    String?
+  media      Media?   @relation(fields: [mediaId], references: [id], onDelete: SetNull)
+  isCorrect  Boolean  @default(false)
+
+  @@unique([questionId, position])
+}
+
+model Media {
+  id           String     @id @default(uuid())
+  ownerId      String
+  kind         String    // IMAGE | AUDIO
+  mimeType     String
+  originalName String
+  storageKey   String     @unique // "<uuid>.<ext>" on the uploads volume
+  sizeBytes    Int
+  width        Int?
+  height       Int?
+  durationSec Float?
+  createdAt    DateTime   @default(now())
+  questions    Question[]
+  choices      Choice[]
+}
+
+model LiveSession {
+  id                   String         @id @default(uuid())
+  code                 String         @unique // 6 chars, unambiguous alphabet
+  quizId               String
+  quiz                 Quiz           @relation(fields: [quizId], references: [id])
+  presenterId          String
+  presenter            Admin          @relation(fields: [presenterId], references: [id])
+  quizSnapshot         Json // QuizSnapshot frozen at session creation
+  settings             Json // LiveSessionSettings, initialised from QuizSettings
+  phase                String         @default("LOBBY")
+  currentQuestionIndex Int            @default(-1) // -1 in lobby
+  questionOpenedAt     DateTime?
+  questionClosesAt     DateTime? // null if no timer
+  createdAt            DateTime       @default(now())
+  startedAt            DateTime?
+  endedAt              DateTime?
+  participants         Participant[]
+  answers              Answer[]
+  questionResults      QuestionResult[]
+
+  @@index([presenterId, createdAt])
+  @@index([phase])
+}
+
+model Participant {
+  id          String      @id @default(uuid())
+  sessionId   String
+  session     LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  nickname    String // displayed as typed (trimmed)
+  nicknameKey String // normalised for uniqueness
+  tokenHash   String      @unique // sha256 of the resume token
+  score       Int         @default(0) // denormalised cache = SUM(Answer.pointsAwarded)
+  isKicked    Boolean     @default(false)
+  joinedAt    DateTime    @default(now())
+  lastSeenAt  DateTime    @default(now())
+  answers     Answer[]
+
+  @@unique([sessionId, nicknameKey])
+}
+
+model Answer {
+  id            String      @id @default(uuid())
+  sessionId     String
+  session       LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  participantId String
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  questionId    String
+  question      Question    @relation(fields: [questionId], references: [id])
+  questionIndex Int
+  payload       Json // normalised AnswerPayload: { choiceId } | { value }
+  isCorrect     Boolean? // null for POLL
+  pointsBase    Int
+  pointsBonus   Int         @default(0)
+  pointsAwarded Int
+  elapsedMs     Int // measured server-side from questionOpenedAt
+  answeredAt    DateTime    @default(now())
+
+  @@unique([participantId, questionId]) // one answer, final
+  @@index([sessionId, questionIndex])
+}
+
+model QuestionResult {
+  id                  String      @id @default(uuid())
+  sessionId           String
+  session             LiveSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  questionId          String
+  questionIndex       Int
+  participantsAtClose Int // non-kicked registered participants at close; ratios use max(1, n)
+  answersCount        Int
+  correctCount        Int
+  distribution        Json // MCQ/TF/POLL: { [choiceId]: count }; NUMERIC: buckets + values
+  fastestCorrect      Json? // { participantId, nickname, elapsedMs }
+  closedAt            DateTime    @default(now())
+
+  @@unique([sessionId, questionId])
+}

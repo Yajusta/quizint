@@ -1,0 +1,49 @@
+Quizint — live quiz application
+Copyright 2026 Yajusta. All rights reserved.
+
+Required Notice: Copyright 2026 Yajusta — Quizint (https://www.yajusta.fr/#contact)
+
+The line above is the notice required by the PolyForm Noncommercial License 1.0.0 (see LICENSE).
+It must travel with every copy, fork, modified version and derivative work, whether or not the
+source is redistributed. Keeping it is a condition of the license, not a courtesy.
+
+
+LICENSING
+---------
+
+Yajusta is the sole copyright holder of this software and licenses it under two distinct sets of
+terms:
+
+  1. PolyForm Noncommercial License 1.0.0 (the LICENSE file) — free of charge, for noncommercial
+     purposes only: personal use, study and research, hobby projects, non-profit organisations,
+     educational institutions, public research bodies, public safety, health and environmental
+     organisations, and government institutions.
+
+  2. A separate commercial license, granted by Yajusta on request. Required for any commercial
+     exploitation, including — without limitation — operating the software as a paid or
+     revenue-generating hosted service (SaaS), reselling it, redistributing it inside a paid
+     product or offering, or using it to deliver paid services to third parties.
+
+Being the copyright holder, Yajusta is not itself bound by the PolyForm terms and retains every
+right to exploit the software commercially.
+
+Commercial licensing enquiries: https://www.yajusta.fr/#contact
+
+
+CONTRIBUTIONS
+-------------
+
+Contributions are accepted under permissive inbound terms so that this dual-licensing model stays
+workable. See CONTRIBUTING.md (English) or CONTRIBUTING.fr.md (français).
+
+
+THIRD-PARTY COMPONENTS
+----------------------
+
+This software depends on third-party open-source packages, each governed by its own license
+(predominantly MIT and Apache-2.0); see pnpm-lock.yaml and the package manifests for the full
+dependency set. Those licenses apply to those components only and do not extend to this software.
+
+The design system under apps/web/src/design-system/ and the kit it is vendored from
+(.claude/skills/quiz-design/) are original works of Yajusta and are covered by the terms above.
+The self-hosted typefaces shipped via @fontsource keep their own upstream licenses.

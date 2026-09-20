@@ -1,0 +1,7 @@
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;font:var(--text-body);color:var(--text-primary);background:var(--surface-page);-webkit-font-smoothing:antialiased}
+h1,h2,h3,h4,p{margin:0}
+a{color:var(--text-link);text-decoration:none;border-bottom:1px solid rgba(74,46,107,.3);transition:color var(--dur-fast) var(--ease-out)}
+a:hover{color:var(--text-link-hover);border-bottom-color:var(--brand-500)}
+:focus-visible{outline:none;box-shadow:var(--focus-ring)}
+::selection{background:var(--brand-100)}

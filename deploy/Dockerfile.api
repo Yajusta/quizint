@@ -1,0 +1,66 @@
+# node:22-alpine, non-root. Three stages:
+#   build      — install, type gate, esbuild bundle
+#   prod-deps  — a pruned node_modules (no vitest/tsx/typescript/esbuild) + Prisma Client
+#   runtime    — compiled JavaScript only
+#
+# Every workspace manifest is copied even though this image only needs the API: pnpm-workspace.yaml
+# declares apps/*, so a missing apps/web/package.json makes the lockfile look stale and
+# --frozen-lockfile refuses. `--filter @quiz/api...` then limits what actually gets installed.
+FROM node:22-alpine AS build
+WORKDIR /app
+RUN corepack enable
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+RUN pnpm install --frozen-lockfile --filter @quiz/api...
+COPY packages/shared packages/shared
+COPY apps/api apps/api
+RUN pnpm --filter @quiz/api prisma:generate \
+    && pnpm --filter @quiz/api typecheck \
+    && pnpm --filter @quiz/api build
+
+# Production dependencies only. @prisma/client and the prisma CLI are runtime needs (the
+# entrypoint applies migrations at boot), hence their place in `dependencies`. The Prisma
+# Client is generated again here because it lands inside this stage's node_modules.
+FROM node:22-alpine AS prod-deps
+WORKDIR /app
+RUN corepack enable
+COPY pnpm-workspace.yaml pnpm-lock.yaml package.json ./
+COPY apps/api/package.json apps/api/
+COPY apps/web/package.json apps/web/
+COPY packages/shared/package.json packages/shared/
+RUN pnpm install --frozen-lockfile --prod --filter @quiz/api...
+COPY apps/api/prisma apps/api/prisma
+RUN pnpm --filter @quiz/api exec prisma generate
+
+FROM node:22-alpine
+# openssl is left unpinned on purpose: Alpine only keeps the current build of a package in its
+# repository, so a pinned version turns every upstream security bump into a broken image build.
+# hadolint ignore=DL3018
+RUN apk add --no-cache openssl \
+    && addgroup -S -g 1001 app \
+    && adduser -S -u 1001 -G app app
+WORKDIR /app
+# The workspace layout is kept: the pnpm links under apps/api/node_modules are relative to
+# /app/node_modules, and packages/shared backs the @quiz/shared link (its code is bundled
+# into dist, so only the manifest is needed here).
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=prod-deps /app/apps/api/node_modules ./apps/api/node_modules
+COPY --from=prod-deps /app/packages/shared ./packages/shared
+COPY --from=build /app/apps/api/dist ./apps/api/dist
+COPY --from=build /app/apps/api/prisma ./apps/api/prisma
+COPY --from=build /app/apps/api/package.json ./apps/api/package.json
+COPY deploy/api-entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh && chown -R app:app /app
+RUN mkdir -p /data/db && chown -R app:app /data
+# Production runtime: also keeps pino off the pino-pretty transport, which is dev-only.
+ENV NODE_ENV=production
+# Numeric uid:gid — the host cannot resolve the image's `app` account.
+USER 1001:1001
+WORKDIR /app/apps/api
+EXPOSE 3000
+# Exec form (DL3025): no shell, so the port is the literal EXPOSEd one rather than $PORT.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
+    CMD ["wget", "-q", "--spider", "http://127.0.0.1:3000/healthz"]
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

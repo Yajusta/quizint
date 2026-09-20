@@ -1,0 +1,88 @@
+/* Copie du kit quiz-design + alias stage locaux (plan § 3.1, voir design-system/README.md). */
+:root {
+  /* neutrals — cool graphite */
+  --gray-950: #0c0e10;
+  --gray-900: #16191c;
+  --gray-800: #22262b;
+  --gray-700: #3a4048;
+  --gray-600: #535a63;
+  --gray-500: #6a7280;
+  --gray-400: #9aa1aa;
+  --gray-300: #c6cbd1;
+  --gray-200: #e2e5e9;
+  --gray-100: #eff1f3;
+  --gray-50: #f7f8f9;
+  --white: #ffffff;
+  /* brand — violet encre (aubergine) */
+  --brand-900: #241638;
+  --brand-800: #36204f;
+  --brand-700: #4a2e6b;
+  --brand-600: #5c3a85;
+  --brand-500: #7351a3;
+  --brand-300: #b39fd0;
+  --brand-100: #e7dff3;
+  --brand-50: #f5f1fa;
+  /* answer states — aucune couleur par proposition ; proposition / sélection / correct / incorrect */
+  --answer-rest-bg: var(--surface-card);
+  --answer-rest-border: var(--border-default);
+  --answer-rest-tile: var(--gray-100);
+  --answer-rest-tile-ink: var(--gray-700);
+  --answer-selected-bg: var(--brand-50);
+  --answer-selected-border: var(--brand-700);
+  --answer-correct-bg: var(--green-100);
+  --answer-correct-border: var(--green-600);
+  --answer-wrong-bg: var(--red-100);
+  --answer-wrong-border: var(--red-600);
+  /* semantic */
+  --green-600: #1b8a5a;
+  --green-100: #dcf1e7;
+  --amber-600: #c98a0a;
+  --amber-100: #fbf0d8;
+  --red-700: #a83126;
+  --red-600: #be3a2b;
+  --red-100: #f8e3e0;
+  --blue-600: #2f6fb5;
+  --blue-100: #e1ebf6;
+  /* aliases */
+  --text-primary: var(--gray-950);
+  --text-secondary: var(--gray-600);
+  --text-muted: var(--gray-500);
+  --text-inverse: var(--white);
+  --text-brand: var(--brand-700);
+  --text-link: var(--brand-700);
+  --text-link-hover: var(--brand-600);
+  --surface-page: var(--gray-50);
+  --surface-card: var(--white);
+  --surface-sunken: var(--gray-100);
+  --surface-inverse: var(--gray-950);
+  --surface-brand: var(--brand-700);
+  --surface-brand-soft: var(--brand-50);
+  --border-subtle: var(--gray-200);
+  --border-default: var(--gray-300);
+  --border-strong: var(--gray-400);
+  --border-brand: var(--brand-500);
+  --state-success: var(--green-600);
+  --state-success-soft: var(--green-100);
+  --state-warning: var(--amber-600);
+  --state-warning-soft: var(--amber-100);
+  --state-danger: var(--red-600);
+  --state-danger-soft: var(--red-100);
+  --state-info: var(--blue-600);
+  --state-info-soft: var(--blue-100);
+  --focus-ring: 0 0 0 3px rgba(115, 81, 163, 0.34);
+  /* stage — fond projeté, encre claire */
+  --stage-bg: var(--brand-900);
+  --stage-ink: #efeaf6;
+  /* Alias stage (§ 3.1 + extensions locales). Le kit écrivait ces alpha en dur dans
+     chaque composant : les valeurs sont celles du kit, seuls les noms sont nouveaux. */
+  --stage-panel: rgba(255, 255, 255, 0.06);
+  --stage-panel-2: rgba(255, 255, 255, 0.1);
+  --stage-control: rgba(255, 255, 255, 0.14);
+  --stage-control-hover: rgba(255, 255, 255, 0.22);
+  --stage-border: rgba(255, 255, 255, 0.12);
+  --stage-border-2: rgba(255, 255, 255, 0.18);
+  --stage-border-strong: rgba(255, 255, 255, 0.28);
+  --stage-ink-2: rgba(239, 234, 246, 0.7);
+  --stage-brand-soft: rgba(179, 159, 208, 0.16);
+  --stage-brand-border: rgba(179, 159, 208, 0.4);
+}

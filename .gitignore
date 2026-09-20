@@ -1,0 +1,25 @@
+node_modules/
+dist/
+build/
+coverage/
+*.tsbuildinfo
+.env
+.env.local
+.env.*.local
+deploy/.env
+apps/api/.env
+uploads/
+test-results/
+playwright-report/
+docs/ARCHITECTURE.md.bak
+.DS_Store
+
+# SQLite database files
+*.db
+*.db-wal
+*.db-shm
+apps/api/data/*.db*
+
+
+.claude/worktrees/
+docs/internal/

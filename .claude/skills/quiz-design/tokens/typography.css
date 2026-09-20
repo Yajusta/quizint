@@ -1,0 +1,9 @@
+:root{
+--text-display-1:700 64px/1.02 var(--font-display);--text-display-2:700 48px/1.06 var(--font-display);--text-question:600 40px/1.18 var(--font-display);
+--text-h1:600 32px/1.18 var(--font-display);--text-h2:600 24px/1.25 var(--font-display);--text-h3:600 19px/1.35 var(--font-sans);
+--text-body-lg:400 17px/1.55 var(--font-sans);--text-body:400 15px/1.55 var(--font-sans);--text-body-sm:400 13px/1.5 var(--font-sans);
+--text-label:500 13px/1.2 var(--font-sans);--text-button:600 15px/1 var(--font-sans);
+--text-overline:600 11px/1.2 var(--font-sans);--text-code:500 14px/1.4 var(--font-mono);--text-numeric-xl:700 72px/1 var(--font-mono);--text-numeric:500 20px/1 var(--font-mono);
+--tracking-tight:-0.02em;--tracking-normal:0;--tracking-wide:0.08em;--tracking-code:0.14em;
+--weight-regular:400;--weight-medium:500;--weight-semibold:600;--weight-bold:700
+}

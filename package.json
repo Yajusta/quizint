@@ -1,0 +1,38 @@
+{
+  "name": "quizint",
+  "private": true,
+  "version": "0.1.0",
+  "license": "SEE LICENSE IN LICENSE",
+  "description": "Interactive live quiz application — Quizint design",
+  "packageManager": "pnpm@12.3.4",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm run --parallel -r dev",
+    "build": "pnpm -r build",
+    "lint": "eslint . && prettier --check .",
+    "format": "prettier --write .",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "test:e2e": "pnpm --filter @quiz/web test:e2e",
+    "db:migrate": "pnpm --filter @quiz/api db:migrate",
+    "db:seed": "pnpm --filter @quiz/api db:seed",
+    "docs:protocol": "pnpm --filter @quiz/shared docs:protocol",
+    "mock:live": "pnpm --filter @quiz/shared mock:live",
+    "load-test": "node tools/load-test/run.mjs",
+    "trunk": "powershell -ExecutionPolicy Bypass -File ./trunk.ps1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.30.0",
+    "@typescript-eslint/parser": "^8.30.0",
+    "eslint": "^9.24.0",
+    "eslint-plugin-react-hooks": "^5.2.0",
+    "globals": "^17.12.0",
+    "playwright": "^1.63.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.70.0"
+  }
+}

@@ -1,0 +1,249 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "format": {
+      "type": "string",
+      "const": "quiz-interactif/quiz"
+    },
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "description": {
+      "default": null,
+      "anyOf": [
+        {
+          "type": "string",
+          "maxLength": 2000
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "settings": {
+      "default": {},
+      "type": "object",
+      "properties": {
+        "showIntermediateRanking": {
+          "default": true,
+          "type": "boolean"
+        },
+        "showParticipantAnswers": {
+          "default": false,
+          "type": "boolean"
+        },
+        "defaultPointsCorrect": {
+          "default": 100,
+          "type": "integer",
+          "minimum": -10000,
+          "maximum": 10000
+        },
+        "defaultPointsWrong": {
+          "default": 0,
+          "type": "integer",
+          "minimum": -10000,
+          "maximum": 10000
+        },
+        "defaultTimeLimitSec": {
+          "default": null,
+          "anyOf": [
+            {
+              "type": "integer",
+              "minimum": 5,
+              "maximum": 300
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "questions": {
+      "default": [],
+      "maxItems": 200,
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "MCQ",
+              "TRUE_FALSE",
+              "NUMERIC",
+              "POLL",
+              "TEXT_POLL"
+            ]
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "media": {
+            "default": null,
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "IMAGE",
+                      "AUDIO"
+                    ]
+                  },
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "url"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mediaOnParticipants": {
+            "default": true,
+            "type": "boolean"
+          },
+          "pointsCorrect": {
+            "default": 100,
+            "type": "integer",
+            "minimum": -10000,
+            "maximum": 10000
+          },
+          "pointsWrong": {
+            "default": 0,
+            "type": "integer",
+            "minimum": -10000,
+            "maximum": 10000
+          },
+          "timeLimitSec": {
+            "default": null,
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 5,
+                "maximum": 300
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "speedBonusMax": {
+            "default": 0,
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 10000
+          },
+          "choices": {
+            "default": [],
+            "maxItems": 6,
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "label": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 120
+                },
+                "media": {
+                  "default": null,
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "kind": {
+                          "type": "string",
+                          "enum": [
+                            "IMAGE",
+                            "AUDIO"
+                          ]
+                        },
+                        "url": {
+                          "type": "string",
+                          "format": "uri"
+                        }
+                      },
+                      "required": [
+                        "kind",
+                        "url"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "isCorrect": {
+                  "default": false,
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "label"
+              ]
+            }
+          },
+          "numericAnswer": {
+            "default": null,
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "number"
+                  },
+                  "tolerance": {
+                    "default": 0,
+                    "type": "number",
+                    "minimum": 0
+                  },
+                  "toleranceMode": {
+                    "default": "ABSOLUTE",
+                    "type": "string",
+                    "enum": [
+                      "ABSOLUTE",
+                      "PERCENT"
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "type",
+          "prompt"
+        ]
+      }
+    }
+  },
+  "required": [
+    "format",
+    "version",
+    "title"
+  ]
+}

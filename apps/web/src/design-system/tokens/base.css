@@ -1,0 +1,55 @@
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  font: var(--text-body);
+  color: var(--text-primary);
+  background: var(--surface-page);
+  -webkit-font-smoothing: antialiased;
+}
+h1,
+h2,
+h3,
+h4,
+p {
+  margin: 0;
+}
+/* Ajout local : niveaux de titre par défaut (le kit ne posait que la marge). */
+h1 {
+  font: var(--text-h1);
+  letter-spacing: var(--tracking-tight);
+}
+h2 {
+  font: var(--text-h2);
+  letter-spacing: var(--tracking-tight);
+}
+h3,
+h4 {
+  font: var(--text-h3);
+}
+a {
+  color: var(--text-link);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(74, 46, 107, 0.3);
+  transition: color var(--dur-fast) var(--ease-out);
+}
+a:hover {
+  color: var(--text-link-hover);
+  border-bottom-color: var(--brand-500);
+}
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+::selection {
+  background: var(--brand-100);
+}
+/* Ajout local (lot 1) : le placeholder navigateur (gris sombre) se lisait comme une valeur saisie
+   dans le champ code 32 px. Encre --text-muted, opacité pleine (Firefox l'atténue par défaut). */
+::placeholder {
+  color: var(--gray-400);
+  opacity: 1;
+}

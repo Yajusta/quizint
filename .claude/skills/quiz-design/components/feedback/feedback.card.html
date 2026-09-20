@@ -1,0 +1,30 @@
+<!-- @dsCard group="Components" viewport="700x300" name="Feedback" subtitle="ProgressBar, Timer, Dialog, EmptyState" -->
+<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>body{background:var(--surface-page);padding:20px;font:var(--text-body)}.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.col{display:flex;flex-direction:column;gap:12px}</style></head><body><div id="root"></div>
+<script type="text/babel">
+const { ProgressBar, Timer, Dialog, EmptyState, Button } = window.QuizDesignSystem_2d5b8b;
+const FeedbackCard = () => (
+  <div style={{display:'grid',gridTemplateColumns:'1.1fr 1fr',gap:28,alignItems:'start'}}>
+    <div className="col" style={{gap:20}}>
+      <ProgressBar value={7} max={12} label="Question 7 sur 12" />
+      <ProgressBar value={82} tone="success" size="sm" />
+      <ProgressBar value={22} tone="danger" size="lg" />
+      <div className="row" style={{gap:20}}>
+        <Timer seconds={18} total={20} size="sm" />
+        <Timer seconds={9} total={20} />
+        <Timer seconds={2} total={20} size="sm" />
+      </div>
+    </div>
+    <div style={{position:'relative',minHeight:260,border:'1px solid var(--border-subtle)',borderRadius:'var(--radius-lg)',background:'var(--surface-card)',overflow:'hidden'}}>
+      <EmptyState icon="list-plus" title="Aucun quiz" description="Créez un premier quiz pour lancer une session." action={<Button size="sm" icon="plus">Nouveau quiz</Button>} />
+      <Dialog width={300} title="Terminer la session ?" description="Les participants verront le classement final." onClose={()=>{}}
+        footer={<><Button variant="ghost" size="sm">Annuler</Button><Button variant="danger" size="sm">Terminer</Button></>} />
+    </div>
+  </div>
+);
+ReactDOM.createRoot(document.getElementById('root')).render(<FeedbackCard/>);
+</script></body></html>

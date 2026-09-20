@@ -1,0 +1,20 @@
+:root{
+/* neutrals — cool graphite */
+--gray-950:#0C0E10;--gray-900:#16191C;--gray-800:#22262B;--gray-700:#3A4048;--gray-600:#535A63;--gray-500:#6A7280;--gray-400:#9AA1AA;--gray-300:#C6CBD1;--gray-200:#E2E5E9;--gray-100:#EFF1F3;--gray-50:#F7F8F9;--white:#FFFFFF;
+/* brand — violet encre (aubergine) */
+--brand-900:#241638;--brand-800:#36204F;--brand-700:#4A2E6B;--brand-600:#5C3A85;--brand-500:#7351A3;--brand-300:#B39FD0;--brand-100:#E7DFF3;--brand-50:#F5F1FA;
+/* answer states — no per-option colour; only proposition / sélection / correct / incorrect */
+--answer-rest-bg:var(--surface-card);--answer-rest-border:var(--border-default);--answer-rest-tile:var(--gray-100);--answer-rest-tile-ink:var(--gray-700);
+--answer-selected-bg:var(--brand-50);--answer-selected-border:var(--brand-700);
+--answer-correct-bg:var(--green-100);--answer-correct-border:var(--green-600);
+--answer-wrong-bg:var(--red-100);--answer-wrong-border:var(--red-600);
+/* semantic */
+--green-600:#1B8A5A;--green-100:#DCF1E7;--amber-600:#C98A0A;--amber-100:#FBF0D8;--red-600:#BE3A2B;--red-100:#F8E3E0;--blue-600:#2F6FB5;--blue-100:#E1EBF6;
+/* aliases */
+--text-primary:var(--gray-950);--text-secondary:var(--gray-600);--text-muted:var(--gray-500);--text-inverse:var(--white);--text-brand:var(--brand-700);--text-link:var(--brand-700);--text-link-hover:var(--brand-600);
+--surface-page:var(--gray-50);--surface-card:var(--white);--surface-sunken:var(--gray-100);--surface-inverse:var(--gray-950);--surface-brand:var(--brand-700);--surface-brand-soft:var(--brand-50);
+--border-subtle:var(--gray-200);--border-default:var(--gray-300);--border-strong:var(--gray-400);--border-brand:var(--brand-500);
+--state-success:var(--green-600);--state-success-soft:var(--green-100);--state-warning:var(--amber-600);--state-warning-soft:var(--amber-100);--state-danger:var(--red-600);--state-danger-soft:var(--red-100);--state-info:var(--blue-600);--state-info-soft:var(--blue-100);
+--focus-ring:0 0 0 3px rgba(115,81,163,.34);
+--stage-bg:var(--brand-900);--stage-ink:#EFEAF6
+}

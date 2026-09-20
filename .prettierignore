@@ -1,0 +1,16 @@
+# Skills, agents et worktrees Claude Code : hors périmètre du dépôt.
+.claude/
+
+# Kit vendoré depuis .claude/skills/quiz-design — gardé identique au skill, patchs listés
+# dans apps/web/src/design-system/README.md. Le reformater rendrait le diff avec le skill illisible.
+apps/web/src/design-system/components/**/*.jsx
+apps/web/src/design-system/components/**/*.d.ts
+apps/web/src/design-system/components/**/*.prompt.md
+
+# Généré : réécrits à l'identique par `pnpm docs:protocol` depuis les schémas Zod. Les
+# reformater ferait échouer `prettier --check` au prochain `pnpm docs:protocol`.
+docs/PROTOCOL.md
+docs/quiz-import-schema.json
+
+# Généré.
+pnpm-lock.yaml

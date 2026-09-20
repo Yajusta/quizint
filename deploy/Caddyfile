@@ -1,0 +1,23 @@
+{$DOMAIN} {
+	encode zstd gzip
+
+	handle /api/* {
+		reverse_proxy api:3000
+	}
+	handle /socket.io/* {
+		reverse_proxy api:3000
+	}
+	handle /uploads/* {
+		reverse_proxy api:3000
+	}
+	handle {
+		root * /srv/web
+		try_files {path} /index.html
+		file_server
+		header Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss: ws:; font-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+	}
+
+	header Strict-Transport-Security "max-age=31536000"
+	header X-Content-Type-Options nosniff
+	header Referrer-Policy no-referrer
+}

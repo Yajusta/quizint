@@ -1,0 +1,66 @@
+/* Quizint — point d'entrée du design system. Importer ce seul fichier. */
+@import url('tokens/fonts.css');
+@import url('tokens/colors.css');
+@import url('tokens/typography.css');
+@import url('tokens/spacing.css');
+@import url('tokens/radius.css');
+@import url('tokens/elevation.css');
+@import url('tokens/motion.css');
+@import url('tokens/base.css');
+
+/* Keyframes globales utilisées par les composants (spinner Button, entrées de listes,
+   point d'attente). Le blocage prefers-reduced-motion est dans tokens/motion.css. */
+@keyframes qiSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes qiFade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes qiRise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes qiPulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+/* Ajout local (lot 1) : entrée depuis le haut — pastille de reconnexion du participant (200 ms). */
+@keyframes qiDrop {
+  from {
+    opacity: 0;
+    transform: translateY(-100%);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+/* Ajout local (lot 2) : entrée depuis la droite — panneau participants du stage (200 ms). */
+@keyframes qiSlideIn {
+  from {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}

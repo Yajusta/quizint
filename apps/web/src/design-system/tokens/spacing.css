@@ -1,0 +1,24 @@
+:root {
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 8px;
+  --space-4: 12px;
+  --space-5: 16px;
+  --space-6: 20px;
+  --space-7: 24px;
+  --space-8: 32px;
+  --space-9: 40px;
+  --space-10: 48px;
+  --space-11: 64px;
+  --space-12: 80px;
+  --space-13: 112px;
+  --gutter-page: 32px;
+  --gutter-page-compact: 20px;
+  --max-content: 1160px;
+  --max-prose: 640px;
+  --control-h-sm: 32px;
+  --control-h-md: 40px;
+  --control-h-lg: 52px;
+  --control-h-xl: 64px;
+}

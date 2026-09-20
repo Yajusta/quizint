@@ -1,0 +1,33 @@
+services:
+  web: # Caddy image containing the Vite build (deploy/Dockerfile.web, multi-stage)
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.web
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on: [api]
+    restart: unless-stopped
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.api
+    env_file: .env
+    environment:
+      DATABASE_URL: 'file:/data/db/quiz.db?connection_limit=1'
+      UPLOADS_DIR: /data/uploads
+      PUBLIC_URL: ${PUBLIC_URL:-https://${DOMAIN}}
+    volumes:
+      - uploads:/data/uploads
+      - dbdata:/data/db
+    restart: unless-stopped
+volumes:
+  dbdata: {}
+  uploads: {}
+  caddy-data: {}
+  caddy-config: {}

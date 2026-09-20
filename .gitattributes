@@ -1,0 +1,11 @@
+# Normalise line endings: the repo stores LF and every checkout gets LF, whatever
+# core.autocrlf says on the machine. Prettier (endOfLine: lf) then passes on a fresh
+# worktree without a rewrite pass.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.db binary

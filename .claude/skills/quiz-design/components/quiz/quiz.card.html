@@ -1,0 +1,40 @@
+<!-- @dsCard group="Components" viewport="700x600" name="Quiz" subtitle="AnswerOption, QuestionDisplay, JoinCode, PlayerChip, LeaderboardRow, StatTile" -->
+<!DOCTYPE html><html lang="fr"><head><meta charset="utf-8"><link rel="stylesheet" href="../../styles.css">
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<style>body{background:var(--surface-page);padding:20px;font:var(--text-body)}.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.col{display:flex;flex-direction:column;gap:12px}</style></head><body><div id="root"></div>
+<script type="text/babel">
+const { AnswerOption, QuestionDisplay, JoinCode, PlayerChip, LeaderboardRow, StatTile } = window.QuizDesignSystem_2d5b8b;
+const QuizCard = () => (
+  <div style={{display:'grid',gridTemplateColumns:'1.25fr 1fr',gap:28,alignItems:'start'}}>
+    <div className="col" style={{gap:10}}>
+      <QuestionDisplay index={7} total={12} style={{textAlign:'left',marginBottom:4}}>Quel est le plus long fleuve de France ?</QuestionDisplay>
+      <AnswerOption letter="A" size="sm">La Seine</AnswerOption>
+      <AnswerOption letter="B" size="sm" state="selected">La Loire</AnswerOption>
+      <AnswerOption letter="B" size="sm" state="correct" distribution={58}>La Loire</AnswerOption>
+      <AnswerOption letter="C" size="sm" state="wrong" distribution={12}>Le Rhône</AnswerOption>
+      <AnswerOption letter="D" size="sm" state="muted" distribution={9}>La Garonne</AnswerOption>
+    </div>
+    <div className="col" style={{gap:16}}>
+      <div style={{background:'var(--stage-bg)',borderRadius:'var(--radius-lg)',padding:20}}>
+        <JoinCode code="482 913" size="md" />
+        <div className="row" style={{marginTop:14,gap:8}}>
+          {['Camille','Théo','Nour','Alex'].map((n,i)=><PlayerChip key={n} name={n} seed={i} tone="dark" />)}
+        </div>
+      </div>
+      <div className="col" style={{gap:8}}>
+        <LeaderboardRow rank={1} name="Camille" score={8420} delta={2} />
+        <LeaderboardRow rank={2} name="Théo" score={7980} delta={-1} />
+        <LeaderboardRow rank={7} name="Vous" score={5100} highlight />
+      </div>
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+        <StatTile icon="users" label="Participants" value="24" />
+        <StatTile icon="timer" label="Temps moyen" value="6,4" unit="s" />
+      </div>
+    </div>
+  </div>
+);
+ReactDOM.createRoot(document.getElementById('root')).render(<QuizCard/>);
+</script></body></html>
