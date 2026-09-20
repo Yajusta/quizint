@@ -1,5 +1,7 @@
 # Quizint
 
+![Quizint](apps/web/public/quizint.png)
+
 [English version](README.md)
 
 Application complète de quiz live : back-office d'édition, écran présentateur projeté, participants sur mobile. Monorepo pnpm, TypeScript strict de bout en bout.

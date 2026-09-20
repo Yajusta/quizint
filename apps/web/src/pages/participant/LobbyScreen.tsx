@@ -2,7 +2,7 @@
 
 import { useTranslation } from 'react-i18next';
 
-import { PlayerChip } from '../../design-system/index.ts';
+import { PlayerChip, Wordmark } from '../../design-system/index.ts';
 import { NBSP } from '../../lib/format.ts';
 import { Num, StageShell } from './shells.tsx';
 
@@ -39,6 +39,7 @@ export function LobbyScreen({ nickname, quizTitle, totalQuestions, participantCo
           gap: 'var(--space-8)',
         }}
       >
+        <Wordmark tone="dark" size="lg" />
         <PlayerChip
           name={nickname}
           tone="dark"
