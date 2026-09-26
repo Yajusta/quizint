@@ -966,6 +966,160 @@ describe('auth hardening', () => {
   });
 });
 
+describe('refresh token credential version', () => {
+  // A dedicated admin: these tests change its password over and over, the suite's own must not move.
+  const email = 'rotation@example.fr';
+  const password = 'rotation-pass-12';
+  // Own documentation-range addresses: the login route allows 10 per minute and per IP.
+  let nextIp = 1;
+  const login = async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `198.51.100.${nextIp++}`,
+      payload: { email, password },
+    });
+    expect(res.statusCode).toBe(200);
+    return cookiesObject(setCookieOf(res));
+  };
+  // The race test sends hundreds of refreshes: keep them out of the 127.0.0.1 global bucket the rest
+  // of the file shares.
+  const remoteAddress = '192.0.2.10';
+  const refresh = (c: Record<string, string>) =>
+    app.inject({ method: 'POST', url: '/api/v1/auth/refresh', remoteAddress, cookies: c });
+  const me = (c: Record<string, string>) =>
+    app.inject({ method: 'GET', url: '/api/v1/auth/me', remoteAddress, cookies: c });
+  const changePassword = async (c: Record<string, string>) => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/change-password',
+      remoteAddress,
+      cookies: c,
+      payload: { currentPassword: password, newPassword: password },
+    });
+    expect(res.statusCode).toBe(204);
+    return cookiesObject(setCookieOf(res));
+  };
+  const hasCookie = (res: { cookies: Array<{ name: string; value: string }> }, name: string) =>
+    res.cookies.some((c) => c.name === name && c.value !== '');
+  let adminId = '';
+
+  beforeAll(async () => {
+    adminId = (
+      await app.prisma.admin.create({
+        data: { email, displayName: 'Rotation', passwordHash: await hash(password) },
+      })
+    ).id;
+  });
+
+  afterAll(async () => {
+    await app.prisma.admin.delete({ where: { email } }).catch(() => undefined);
+  });
+
+  it('a password change ends a refresh chain started before it', async () => {
+    const victim = await login();
+    const stolen = await login();
+    const rotated = await refresh(stolen);
+    expect(rotated.statusCode).toBe(200);
+    const derived = cookiesObject(setCookieOf(rotated));
+
+    const fresh = await changePassword(victim);
+    for (const c of [stolen, derived]) {
+      const res = await refresh(c);
+      expect(res.statusCode).toBe(401);
+      expect(hasCookie(res, 'access_token')).toBe(false);
+      expect((await me(c)).statusCode).toBe(401);
+    }
+    // The browser that changed the password keeps going.
+    expect((await me(fresh)).statusCode).toBe(200);
+    const next = await refresh(fresh);
+    expect(next.statusCode).toBe(200);
+    expect((await me(cookiesObject(setCookieOf(next)))).statusCode).toBe(200);
+  });
+
+  it('a live row from an older credential version gets nothing, grace path included', async () => {
+    const before = await app.prisma.admin.findUniqueOrThrow({ where: { id: adminId } });
+    await changePassword(await login());
+    // What a rotation racing the revokeAdminSessions sweep used to leave behind: a live successor,
+    // and a row revoked a second ago (inside the rotation grace), both from the previous version.
+    const plant = async (revokedAt: Date | null) => {
+      const token = `planted-${Math.random().toString(36).slice(2)}`;
+      await app.prisma.refreshToken.create({
+        data: {
+          adminId,
+          tokenHash: sha256(token),
+          expiresAt: new Date(Date.now() + 60_000),
+          revokedAt,
+          credentialVersion: before.passwordChangedAt,
+        },
+      });
+      return token;
+    };
+    for (const token of [await plant(null), await plant(new Date(Date.now() - 1000))]) {
+      const res = await refresh({ refresh_token: token });
+      expect(res.statusCode).toBe(401);
+      expect(hasCookie(res, 'access_token')).toBe(false);
+      expect(hasCookie(res, 'refresh_token')).toBe(false);
+    }
+  });
+
+  it('replaying a token rotated before a password change does not end the sessions opened since', async () => {
+    const before = await app.prisma.admin.findUniqueOrThrow({ where: { id: adminId } });
+    const fresh = await changePassword(await login());
+    // A stolen token rotated a minute ago, before the change: beyond the grace, so plain reuse
+    // detection would revoke the whole family, the post-change sessions included.
+    const token = `rotated-${Math.random().toString(36).slice(2)}`;
+    await app.prisma.refreshToken.create({
+      data: {
+        adminId,
+        tokenHash: sha256(token),
+        expiresAt: new Date(Date.now() + 60 * 60_000),
+        revokedAt: new Date(Date.now() - 60_000),
+        credentialVersion: before.passwordChangedAt,
+      },
+    });
+    expect((await refresh({ refresh_token: token })).statusCode).toBe(401);
+    const next = await refresh(fresh);
+    expect(next.statusCode).toBe(200);
+    expect(hasCookie(next, 'refresh_token')).toBe(true);
+  });
+
+  it('a refresh chain racing a password change never survives it', async () => {
+    let victim = await login();
+    for (let round = 0; round < 20; round++) {
+      const stolen = await login();
+      // The thief rotates as fast as it can while the victim changes the password.
+      const chain = async () => {
+        let current = stolen;
+        for (let step = 0; step < 50; step++) {
+          const res = await refresh(current);
+          if (res.statusCode !== 200 || !hasCookie(res, 'refresh_token')) break;
+          current = cookiesObject(setCookieOf(res));
+        }
+        return current;
+      };
+      const [last, fresh] = await Promise.all([chain(), changePassword(victim)]);
+      victim = fresh;
+      expect((await refresh(last)).statusCode).toBe(401);
+      expect((await me(last)).statusCode).toBe(401);
+      const { passwordChangedAt } = await app.prisma.admin.findUniqueOrThrow({ where: { id: adminId } });
+      // No live row of an older version is left behind at all (the transaction), and the version
+      // check in /auth/refresh would refuse one anyway (the test above).
+      // NULL-safe: `NOT (col = ?)` alone would skip a NULL-version row.
+      const stale = await app.prisma.refreshToken.count({
+        where: {
+          adminId,
+          revokedAt: null,
+          OR: [{ credentialVersion: null }, { NOT: { credentialVersion: passwordChangedAt } }],
+        },
+      });
+      expect(stale).toBe(0);
+    }
+    expect((await me(victim)).statusCode).toBe(200);
+    expect((await refresh(victim)).statusCode).toBe(200);
+  }, 60_000);
+});
+
 describe('live engine', () => {
   /** Enough of a socket.io Socket for the SessionManager: an id, `data`, rooms. */
   const fakeSocket = (id: string, readyState = 'open') =>

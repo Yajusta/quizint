@@ -52,28 +52,28 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
 
       app.issueAccessToken(reply, admin);
-      await app.issueRefreshToken(reply, admin.id);
+      await app.issueRefreshToken(reply, admin.id, admin.passwordChangedAt);
       return { admin: toAdminDTO(admin) };
     },
   );
 
   // --- POST /api/v1/auth/refresh -------------------------------------------
   app.post('/auth/refresh', async (req, reply) => {
-    const row = await app.verifyRefreshToken(req);
-    if (!row) {
+    // verifyRefreshToken also refuses an inactive admin and a family opened under an older password
+    // (a rotation racing revokeAdminSessions may have minted a live successor): such a row gets
+    // nothing, not even the access token of the grace path below.
+    const check = await app.verifyRefreshToken(req);
+    if (!check) {
       app.clearAuthCookies(reply);
       return reply.status(401).send(apiError('UNAUTHORIZED'));
     }
-    const admin = await app.prisma.admin.findUnique({ where: { id: row.adminId } });
-    if (!admin || !admin.isActive) {
-      app.clearAuthCookies(reply);
-      return reply.status(401).send(apiError('UNAUTHORIZED'));
-    }
+    const { admin } = check;
     app.issueAccessToken(reply, admin);
     // A replay inside the rotation grace gets an access token only (issueRefreshToken returns null):
     // the refresh token minted by the first rotation is already in this browser's cookie jar, and a
-    // stolen copy must not mint a second, independent one (see REFRESH_ROTATION_GRACE_MS).
-    await app.issueRefreshToken(reply, admin.id, req.cookies[REFRESH_TOKEN_COOKIE]);
+    // stolen copy must not mint a second, independent one (see REFRESH_ROTATION_GRACE_MS). The
+    // successor inherits the row's credential version, never re-read from the admin.
+    await app.issueRefreshToken(reply, admin.id, check.credentialVersion, check.id);
     return { admin: toAdminDTO(admin) };
   });
 
@@ -176,7 +176,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // this browser gets fresh cookies so the admin who just changed their password stays signed in.
     await app.revokeAdminSessions(admin.id);
     app.issueAccessToken(reply, updated);
-    await app.issueRefreshToken(reply, admin.id, undefined);
+    await app.issueRefreshToken(reply, admin.id, updated.passwordChangedAt);
     return reply.status(204).send();
   });
 }

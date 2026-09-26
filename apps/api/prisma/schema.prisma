@@ -24,13 +24,16 @@ model Admin {
 }
 
 model RefreshToken {
-  id        String    @id @default(uuid())
-  adminId   String
-  admin     Admin     @relation(fields: [adminId], references: [id], onDelete: Cascade)
-  tokenHash String    @unique // sha256 of the opaque token
-  expiresAt DateTime
-  revokedAt DateTime?
-  createdAt DateTime  @default(now())
+  id                String    @id @default(uuid())
+  adminId           String
+  admin             Admin     @relation(fields: [adminId], references: [id], onDelete: Cascade)
+  tokenHash         String    @unique // sha256 of the opaque token
+  expiresAt         DateTime
+  revokedAt         DateTime?
+  // Admin.passwordChangedAt when the family was opened (login, change-password); inherited on
+  // rotation. A refresh whose version no longer matches the admin's is refused.
+  credentialVersion DateTime?
+  createdAt         DateTime  @default(now())
 
   @@index([adminId])
 }
