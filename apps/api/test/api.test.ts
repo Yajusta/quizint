@@ -4,14 +4,19 @@
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hash } from 'argon2';
+import { createHmac } from 'node:crypto';
 
 import {
+  ADMIN_PASSWORD_MAX_LENGTH,
   ENDED_PURGE_DELAY_MS,
   MAX_JOINS_PER_SECOND_PER_SESSION,
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
 
-import { buildApp } from '../src/app.js';
+import { buildApp, trustCaddyHop } from '../src/app.js';
+import { getConfig } from '../src/config.js';
+import { JWT_AUDIENCE, JWT_ISSUER } from '../src/plugins/auth.js';
+import { allowedOrigins } from '../src/plugins/csrf.js';
 import { sha256 } from '../src/lib/api.js';
 import { SessionManager } from '../src/modules/live/SessionManager.js';
 import type { FastifyInstance } from 'fastify';
@@ -49,6 +54,67 @@ describe('health', () => {
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ status: 'ok' });
+  });
+});
+
+describe('probe app', () => {
+  // A second app, so test-only routes can be added before it is ready. It runs before any session
+  // exists, so its boot load has nothing to pick up from the shared database.
+  let probe: FastifyInstance;
+  const ips: string[] = [];
+  beforeAll(async () => {
+    probe = await buildApp();
+    probe.get('/ip', async (req) => {
+      ips.push(req.ip);
+      return {};
+    });
+    probe.get('/boom', async () => {
+      throw new Error('Invalid `prisma.admin.findMany()` invocation: no such column: Admin.passwordHash');
+    });
+    probe.get('/teapot', async () => {
+      throw Object.assign(new Error('short and stout'), { statusCode: 418 });
+    });
+    await probe.ready();
+  }, 30000);
+  afterAll(() => probe.close());
+
+  it('a 5xx answers the generic INTERNAL envelope, never the raw error message', async () => {
+    const res = await probe.inject({ method: 'GET', url: '/boom' });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: { code: 'INTERNAL', message: 'Erreur interne' } });
+    expect(res.body).not.toContain('prisma');
+  });
+
+  it('a 4xx keeps the answer Fastify gives it', async () => {
+    const teapot = await probe.inject({ method: 'GET', url: '/teapot' });
+    expect(teapot.statusCode).toBe(418);
+    expect(teapot.json().message).toBe('short and stout');
+    const badJson = await probe.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: '{"email":',
+    });
+    expect(badJson.statusCode).toBe(400);
+    expect(badJson.json().code).toBe('FST_ERR_CTP_INVALID_JSON_BODY');
+  });
+
+  it('a spoofed X-Forwarded-For does not choose the client IP', async () => {
+    // Behind Caddy: the right-most entry, the one Caddy wrote, whatever the client prepended.
+    await probe.inject({
+      method: 'GET',
+      url: '/ip',
+      remoteAddress: '172.18.0.3',
+      headers: { 'x-forwarded-for': '1.2.3.4, 198.51.100.7' },
+    });
+    // A directly reachable port: the header is not believed at all.
+    await probe.inject({
+      method: 'GET',
+      url: '/ip',
+      remoteAddress: '203.0.113.50',
+      headers: { 'x-forwarded-for': '1.2.3.4' },
+    });
+    expect(ips).toEqual(['198.51.100.7', '203.0.113.50']);
   });
 });
 
@@ -106,7 +172,10 @@ describe('auth', () => {
       app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: first }),
     ]);
     expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
-    const rotated = cookiesObject(setCookieOf(a));
+    // One token in, one successor out: only the winner sets a refresh cookie, the loser an access one.
+    const hasRefresh = (r: typeof a) => r.cookies.some((c) => c.name === 'refresh_token');
+    expect([a, b].filter(hasRefresh)).toHaveLength(1);
+    const rotated = cookiesObject(setCookieOf(hasRefresh(a) ? a : b));
     const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: rotated });
     expect(me.statusCode).toBe(200);
 
@@ -146,12 +215,14 @@ describe('auth', () => {
     });
     const replay = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: first });
     expect(replay.statusCode).toBe(200);
+    // …with an access token only: the grace never mints a second refresh token.
+    expect(replay.cookies.map((c) => c.name)).toEqual(['access_token']);
     // …but does not move the revocation time: the window closes 10 s after the *first* rotation.
     const row = await app.prisma.refreshToken.findUniqueOrThrow({ where: { tokenHash: firstHash } });
     expect(row.revokedAt?.getTime()).toBe(sixSecondsAgo.getTime());
 
     // Logout expires the cookie outright: no grace, a replay is refused at once.
-    const current = cookiesObject(setCookieOf(replay));
+    const current = { ...cookiesObject(setCookieOf(rotate)), ...cookiesObject(setCookieOf(replay)) };
     expect(
       (await app.inject({ method: 'POST', url: '/api/v1/auth/logout', cookies: current })).statusCode,
     ).toBe(204);
@@ -558,6 +629,14 @@ describe('account security', () => {
       payload: { currentPassword: TEST_PASSWORD, newPassword: TEST_PASSWORD },
     });
     expect(changed.statusCode).toBe(204);
+    // Every access JWT signed before the change is refused at once, this browser's previous one
+    // included — most likely signed in the very same second, which `iat` alone could not tell apart —
+    // while the one change-password just handed back works.
+    const me = (c: Record<string, string>) =>
+      app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: c });
+    expect((await me(other)).statusCode).toBe(401);
+    expect((await me(mine)).statusCode).toBe(401);
+    expect((await me(cookiesObject(setCookieOf(changed)))).statusCode).toBe(200);
     // The other browser's refresh token is revoked; this browser got fresh cookies.
     expect(
       (await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: other })).statusCode,
@@ -570,6 +649,182 @@ describe('account security', () => {
     expect(refreshed.statusCode).toBe(200);
     // The suite keeps these (no extra login: the login route allows 10 per minute and per IP).
     cookies = setCookieOf(refreshed);
+  });
+});
+
+describe('auth hardening', () => {
+  // Logins from their own documentation-range addresses: the login route allows 10 per minute and
+  // per IP, and the suite above already spends most of 127.0.0.1's budget.
+  let nextIp = 1;
+  const loginFrom = (email = TEST_EMAIL, password = TEST_PASSWORD) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `203.0.113.${nextIp++}`,
+      payload: { email, password },
+    });
+  const me = (c: Record<string, string>) => app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: c });
+  const b64url = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+  /** Hand-signed JWT, to try what our own signer never produces. */
+  const forge = (header: Record<string, unknown>, claims: Record<string, unknown>, hmac = 'sha256') => {
+    const input = `${b64url(header)}.${b64url(claims)}`;
+    const sig = createHmac(hmac, getConfig().JWT_SECRET).update(input).digest('base64url');
+    return `${input}.${sig}`;
+  };
+
+  it('PATCH /admins/:id refuses a password: nobody resets a colleague’s password', async () => {
+    const self = (await me(cookiesObject(cookies))).json().admin.id as string;
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/admins/${self}`,
+      cookies: cookiesObject(cookies),
+      payload: { password: 'thief-chosen-password-33' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION');
+    // Nothing was written: the suite's password still signs in.
+    expect((await loginFrom()).statusCode).toBe(200);
+  });
+
+  it('a password longer than ADMIN_PASSWORD_MAX_LENGTH is a 400 on every route', async () => {
+    const long = 'x'.repeat(ADMIN_PASSWORD_MAX_LENGTH + 1);
+    const login = await loginFrom(TEST_EMAIL, long);
+    expect(login.statusCode).toBe(400);
+    expect(login.json().error.code).toBe('INVALID_CREDENTIALS');
+    const create = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admins',
+      cookies: cookiesObject(cookies),
+      payload: { email: 'long@example.fr', displayName: 'Long', password: long },
+    });
+    expect(create.statusCode).toBe(400);
+    const change = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/change-password',
+      cookies: cookiesObject(cookies),
+      payload: { currentPassword: TEST_PASSWORD, newPassword: long },
+    });
+    expect(change.statusCode).toBe(400);
+  });
+
+  it('an access JWT with another algorithm, issuer or audience is refused', async () => {
+    const admin = await app.prisma.admin.findUniqueOrThrow({ where: { email: TEST_EMAIL } });
+    const now = Math.floor(Date.now() / 1000);
+    const claims = {
+      sub: admin.id,
+      email: admin.email,
+      jti: 'forged',
+      ...(admin.passwordChangedAt ? { pca: admin.passwordChangedAt.getTime() } : {}),
+      iat: now,
+      exp: now + 60,
+      iss: JWT_ISSUER,
+      aud: JWT_AUDIENCE,
+    };
+    const hs256 = { alg: 'HS256', typ: 'JWT' };
+    const withToken = (token: string) => me({ access_token: token });
+    // Control: the helper does produce a token the API accepts.
+    expect((await withToken(forge(hs256, claims))).statusCode).toBe(200);
+    expect((await withToken(forge({ alg: 'HS512', typ: 'JWT' }, claims, 'sha512'))).statusCode).toBe(401);
+    expect((await withToken(`${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(claims)}.`)).statusCode).toBe(
+      401,
+    );
+    expect((await withToken(forge(hs256, { ...claims, iss: 'someone-else' }))).statusCode).toBe(401);
+    expect((await withToken(forge(hs256, { ...claims, aud: 'someone-else' }))).statusCode).toBe(401);
+    // Absent claims, not just wrong ones (fast-jwt would skip the check of a missing claim).
+    for (const missing of ['iss', 'aud', 'exp'] as const) {
+      const partial: Record<string, unknown> = { ...claims };
+      delete partial[missing];
+      expect((await withToken(forge(hs256, partial))).statusCode).toBe(401);
+    }
+  });
+
+  it('logout ends the access JWT too, not 15 min later', async () => {
+    const session = cookiesObject(setCookieOf(await loginFrom()));
+    expect((await me(session)).statusCode).toBe(200);
+    const out = await app.inject({ method: 'POST', url: '/api/v1/auth/logout', cookies: session });
+    expect(out.statusCode).toBe(204);
+    expect((await me(session)).statusCode).toBe(401);
+    // Only that token: the suite's own session is untouched.
+    expect((await me(cookiesObject(cookies))).statusCode).toBe(200);
+  });
+
+  it('a stolen refresh token replayed inside the grace window mints no independent refresh token', async () => {
+    const stolen = cookiesObject(setCookieOf(await loginFrom()));
+    const { id: adminId } = (await me(stolen)).json().admin as { id: string };
+    // The legitimate browser rotates first…
+    const legit = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(legit.statusCode).toBe(200);
+    const live = () => app.prisma.refreshToken.count({ where: { adminId, revokedAt: null } });
+    const before = await live();
+    // …then the thief replays the copy within the grace: an access token, no refresh cookie, no row.
+    const replay = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.cookies.some((c) => c.name === 'refresh_token')).toBe(false);
+    expect(await live()).toBe(before);
+    // Once the grace is over, the same replay is theft: the whole family goes, legit browser included.
+    await app.prisma.refreshToken.update({
+      where: { tokenHash: sha256(stolen.refresh_token!) },
+      data: { revokedAt: new Date(Date.now() - 60_000) },
+    });
+    const late = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(late.statusCode).toBe(401);
+    const legitAgain = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      cookies: cookiesObject(setCookieOf(legit)),
+    });
+    expect(legitAgain.statusCode).toBe(401);
+    // Restore the suite's cookies (the family revocation took them too).
+    cookies = setCookieOf(await loginFrom());
+  });
+
+  describe('CSRF', () => {
+    const rename = async (headers: Record<string, string>) => {
+      const self = (await me(cookiesObject(cookies))).json().admin.id as string;
+      return app.inject({
+        method: 'PATCH',
+        url: `/api/v1/admins/${self}`,
+        cookies: cookiesObject(cookies),
+        headers,
+        payload: { displayName: 'Test' },
+      });
+    };
+
+    it('a cross-site or same-site browser request is refused', async () => {
+      for (const site of ['cross-site', 'same-site']) {
+        const res = await rename({ 'sec-fetch-site': site, origin: 'http://localhost:5173' });
+        expect(res.statusCode).toBe(403);
+        expect(res.json().error.code).toBe('FORBIDDEN');
+      }
+      // A browser without Fetch Metadata: the Origin alone decides.
+      expect((await rename({ origin: 'https://evil.example' })).statusCode).toBe(403);
+      expect((await rename({ origin: 'null' })).statusCode).toBe(403);
+    });
+
+    it('the app’s own origin, a typed URL and a non-browser client pass', async () => {
+      expect(
+        (await rename({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:5173' })).statusCode,
+      ).toBe(200);
+      // Vite listens on 127.0.0.1: outside production the loopback aliases of PUBLIC_URL are the app too.
+      expect((await rename({ origin: 'http://127.0.0.1:5173' })).statusCode).toBe(200);
+      expect((await rename({ 'sec-fetch-site': 'none' })).statusCode).toBe(200);
+      expect((await rename({})).statusCode).toBe(200);
+    });
+
+    it('only the origin of PUBLIC_URL is allowed in production', () => {
+      expect([...allowedOrigins('https://quiz.example.fr/', true)]).toEqual(['https://quiz.example.fr']);
+      expect(allowedOrigins('http://localhost:5173', true).has('http://127.0.0.1:5173')).toBe(false);
+      expect(allowedOrigins('http://localhost:5173', false).has('http://127.0.0.1:5173')).toBe(true);
+      expect(allowedOrigins('https://quiz.example.fr', false).size).toBe(1);
+    });
+  });
+
+  it('X-Forwarded-For is believed for exactly one hop, and only from a private peer', () => {
+    expect(trustCaddyHop('172.18.0.3', 0)).toBe(true); // Caddy on the compose network
+    expect(trustCaddyHop('::ffff:172.18.0.3', 0)).toBe(true);
+    expect(trustCaddyHop('127.0.0.1', 0)).toBe(true);
+    expect(trustCaddyHop('172.18.0.3', 1)).toBe(false); // the entry Caddy wrote is the client
+    expect(trustCaddyHop('203.0.113.9', 0)).toBe(false); // a directly exposed port: header ignored
   });
 });
 

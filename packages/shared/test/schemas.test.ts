@@ -1,9 +1,40 @@
 import { describe, expect, it } from 'vitest';
 
-import { QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
+import { ADMIN_PASSWORD_MAX_LENGTH, QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
 import { LiveSessionSettings, LiveSessionSettingsPatch, QuizExportV1 } from '../src/schemas/domain.js';
 import { SettingsUpdateCommand } from '../src/schemas/events.js';
-import { QuizCreateInput, QuizPatchInput } from '../src/schemas/rest.js';
+import {
+  AdminCreateInput,
+  AdminPatchInput,
+  ChangePasswordInput,
+  LoginInput,
+  QuizCreateInput,
+  QuizPatchInput,
+} from '../src/schemas/rest.js';
+
+describe('admin credentials', () => {
+  it('AdminPatchInput is strict and carries no password (no colleague reset)', () => {
+    expect(AdminPatchInput.safeParse({ password: 'a-new-password-12' }).success).toBe(false);
+    expect(AdminPatchInput.safeParse({ isActive: false, extra: 1 }).success).toBe(false);
+    expect(AdminPatchInput.parse({ displayName: ' Ada ', isActive: true })).toEqual({
+      displayName: 'Ada',
+      isActive: true,
+    });
+  });
+
+  it('every password field is bounded by ADMIN_PASSWORD_MAX_LENGTH', () => {
+    const max = 'x'.repeat(ADMIN_PASSWORD_MAX_LENGTH);
+    const over = `${max}x`;
+    const email = 'a@example.fr';
+    expect(LoginInput.safeParse({ email, password: max }).success).toBe(true);
+    expect(LoginInput.safeParse({ email, password: over }).success).toBe(false);
+    expect(AdminCreateInput.safeParse({ email, displayName: 'A', password: max }).success).toBe(true);
+    expect(AdminCreateInput.safeParse({ email, displayName: 'A', password: over }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: over, newPassword: max }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: over }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: max }).success).toBe(true);
+  });
+});
 
 describe('settings patches', () => {
   it('LiveSessionSettings fills the defaults of absent flags', () => {
