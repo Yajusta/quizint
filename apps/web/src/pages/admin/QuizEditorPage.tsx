@@ -13,7 +13,7 @@ import { z } from 'zod';
 
 import { QuestionDTO, QuizSettings } from '@quiz/shared';
 
-import { apiJson, ApiErrorThrown } from '../../lib/api-client.ts';
+import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { useMediaQuery } from '../../lib/useMediaQuery.ts';
 import { Button, Card, Dialog, EmptyState, Icon, Tabs } from '../../design-system/index.ts';
 import { ListSkeleton } from '../../components/Skeletons.tsx';
@@ -148,7 +148,7 @@ export function QuizEditorPage() {
     }
     setLoading(true);
     apiJson
-      .get(`/quizzes/${id}`, QuizDetailSchema)
+      .get(apiPath`/quizzes/${id}`, QuizDetailSchema)
       .then(({ quiz }) => {
         if (!alive) return;
         const qs = applyServer(quiz);
@@ -311,7 +311,7 @@ export function QuizEditorPage() {
         navigate(`/admin/quizzes/${currentId}`, { replace: true });
       } else if (title.trim() !== baseline.title || description.trim() !== baseline.description) {
         await apiJson.patch(
-          `/quizzes/${currentId}`,
+          apiPath`/quizzes/${currentId}`,
           { title: title.trim(), description: description.trim() || null },
           z.unknown(),
         );
@@ -319,7 +319,7 @@ export function QuizEditorPage() {
       let savedQuestions = questions;
       if (created || questionsJson !== baseline.questions) {
         const res = await apiJson.put(
-          `/quizzes/${currentId}/questions`,
+          apiPath`/quizzes/${currentId}/questions`,
           { questions: questions.map(toServerQuestion) },
           QuestionsResponse,
         );
@@ -382,7 +382,7 @@ export function QuizEditorPage() {
       const currentId = dirty || !quizId ? await save() : quizId;
       if (!currentId) return;
       const created = await apiJson.post(
-        `/quizzes/${currentId}/sessions`,
+        apiPath`/quizzes/${currentId}/sessions`,
         {},
         z.object({ sessionId: z.string() }),
       );
@@ -398,7 +398,7 @@ export function QuizEditorPage() {
     if (!quizId) return;
     try {
       const copy = await apiJson.post(
-        `/quizzes/${quizId}/duplicate`,
+        apiPath`/quizzes/${quizId}/duplicate`,
         {},
         z.object({ quiz: z.object({ id: z.string() }) }),
       );
@@ -409,7 +409,7 @@ export function QuizEditorPage() {
   };
 
   const exportJson = () => {
-    if (quizId) window.open(`/api/v1/quizzes/${quizId}/export`, '_blank', 'noopener');
+    if (quizId) window.open(apiPath`/api/v1/quizzes/${quizId}/export`, '_blank', 'noopener');
   };
 
   const discardDraft = () => {
@@ -423,7 +423,7 @@ export function QuizEditorPage() {
     }
     setLoading(true);
     apiJson
-      .get(`/quizzes/${quizId}`, QuizDetailSchema)
+      .get(apiPath`/quizzes/${quizId}`, QuizDetailSchema)
       .then(({ quiz }) => {
         const qs = applyServer(quiz);
         setSelectedKey(qs[0]?.key ?? null);

@@ -59,6 +59,9 @@ import {
 import { FIXTURE_QUIZ_SHOWCASE, FIXTURE_QUIZ_SNAPSHOT } from '../test/fixtures.js';
 
 const PORT = Number(process.env.MOCK_PORT ?? 4001);
+// Loopback by default: the mock accepts any presenter without authentication, so it must not be
+// reachable from the LAN unless someone opts in explicitly (MOCK_HOST=0.0.0.0).
+const HOST = process.env.MOCK_HOST ?? '127.0.0.1';
 const PUBLIC_URL = process.env.MOCK_PUBLIC_URL ?? 'http://localhost:5173';
 
 type FixtureKind = 'demo' | 'showcase';
@@ -883,6 +886,6 @@ presenterNs.on('connection', (socket: Socket) => {
   }
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`[mock] live server on http://localhost:${PORT} (socket.io path /socket.io)`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`[mock] live server on http://${HOST}:${PORT} (socket.io path /socket.io)`);
 });

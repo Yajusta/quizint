@@ -10,6 +10,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router';
 import { LanguageSwitcher } from '../../components/LanguageSwitcher.tsx';
 import { fetchMe, resetMe } from '../../lib/admin-identity.ts';
 import { Badge, Button, Tabs, Wordmark } from '../../design-system/index.ts';
+import { clearAllDrafts } from './editor/model.ts';
 
 /** Active tab derived from the URL — the editor and the session detail stay under their section. */
 function tabFor(pathname: string): string {
@@ -112,6 +113,7 @@ export function AdminLayout({ children }: { children?: ReactNode }) {
   const logout = async () => {
     await fetch('/api/v1/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined);
     resetMe();
+    clearAllDrafts();
     navigate('/admin/login');
   };
 

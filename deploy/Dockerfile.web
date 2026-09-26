@@ -1,7 +1,14 @@
-# Stage 1: Vite build — Stage 2: caddy:2-alpine with dist + Caddyfile
+# Stage 1: Vite build — Stage 2: Caddy 2 on Alpine with dist + Caddyfile
 # All workspace manifests are copied so the lockfile is complete for --frozen-lockfile;
 # `--filter @quiz/web...` limits what actually gets installed.
-FROM node:22-alpine AS build
+#
+# Base images are pinned by exact tag *and* multi-arch index digest, so a rebuild never picks up a
+# different image silently. To bump: `docker pull <image>:<new-tag>` then
+# `docker image inspect <image>:<new-tag> --format '{{json .RepoDigests}}'` (or
+# `docker buildx imagetools inspect <image>:<new-tag>`) and replace tag + digest on every FROM line.
+# pnpm itself is pinned by the sha512 in the root package.json `packageManager`, which corepack
+# verifies before running it.
+FROM node:22.23.3-alpine3.24@sha256:0a7108bf6c7bf5de370ffb1a3ed6be93d405b43ff159f681a8d18c0e2bc2e402 AS build
 WORKDIR /app
 RUN corepack enable
 COPY pnpm-workspace.yaml pnpm-lock.yaml package.json tsconfig.base.json ./
@@ -13,12 +20,12 @@ COPY packages/shared packages/shared
 COPY apps/web apps/web
 RUN pnpm --filter @quiz/web build
 
-# Stays root, unlike the API image: caddy:2-alpine declares /data and /config as volumes, so a
+# Stays root, unlike the API image: the caddy image declares /data and /config as volumes, so a
 # `chown` in a derived layer is discarded at build time and an unprivileged Caddy could no longer
 # write the ACME certificates it stores under /data. Moving the store elsewhere would mean
 # retargeting XDG_DATA_HOME and the compose volumes — out of scope for a lint finding.
 # checkov:skip=CKV_DOCKER_3: Caddy needs to own its /data volume; see the note above.
-FROM caddy:2-alpine
+FROM caddy:2.11.4-alpine@sha256:6aeddd44c3078b0f9a35206472a11420648a79c184603ef95957d0a20044cb2b
 COPY --from=build /app/apps/web/dist /srv/web
 COPY deploy/Caddyfile /etc/caddy/Caddyfile
 EXPOSE 80 443

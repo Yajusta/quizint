@@ -194,7 +194,7 @@ export function PresenterSessionPage() {
   );
 
   const openEnd = () => setEndDialog(true);
-  const goResults = () => navigate(`/admin/sessions/${sessionId}`);
+  const goResults = () => navigate(`/admin/sessions/${encodeURIComponent(sessionId)}`);
 
   if (live.phase === 'ENDED') return <StageEnded onHistory={goResults} />;
   if (live.phase === null) return <PresenterSkeleton quizTitle={live.quizTitle ?? undefined} />;
