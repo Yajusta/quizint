@@ -90,6 +90,11 @@ export const livePlugin = fp(
         });
       };
 
+    // ---------------- default namespace ----------------
+    // socket.io always serves `/`, and no client uses it: without this guard it would accept any
+    // number of anonymous sockets per IP, outside the /participant caps. Every handshake is refused.
+    io.of('/').use((_socket, next) => next(socketError('NOT_FOUND', errorMessage('NOT_FOUND'))));
+
     // ---------------- /participant namespace ----------------
     io.of('/participant').use(async (socket, next) => {
       const ip = socketIp(socket);

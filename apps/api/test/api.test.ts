@@ -2254,8 +2254,14 @@ describe('live engine', () => {
       base = `http://127.0.0.1:${address.port}`;
     });
 
-    afterAll(() => {
+    // Waits for the server to drop every engine.io connection: a polling one still open when the
+    // file's app.close() runs holds it until the next ping, past the hook timeout.
+    afterAll(async () => {
       for (const socket of opened) socket.close();
+      const deadline = Date.now() + 5000;
+      while (app.io.engine.clientsCount > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
     });
 
     /** Resolves 'connected' or the refusal: `data.code` for a middleware one, the message otherwise. */
@@ -2311,6 +2317,14 @@ describe('live engine', () => {
             expect.stringMatching(/error/i),
           ]);
         }
+      }
+    });
+
+    it('refuses every handshake on the default namespace', async () => {
+      for (const transport of ['websocket', 'polling'] as const) {
+        expect(await handshake('/', { transport })).toBe('NOT_FOUND');
+        expect(await handshake('/', { origin: 'http://localhost:5173', transport })).toBe('NOT_FOUND');
+        expect(await handshake('/participant', { transport })).toBe('connected');
       }
     });
 
