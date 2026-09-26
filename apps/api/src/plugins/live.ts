@@ -24,6 +24,7 @@ import {
 import { ACCESS_TOKEN_COOKIE } from '../lib/api.js';
 import { SessionManager, presenterRoom } from '../modules/live/SessionManager.js';
 import { ConcurrencyCap, SocketLimiter, clientIp, isAllowedOrigin } from '../modules/live/socket-guards.js';
+import { allowedOrigins } from './csrf.js';
 
 /** socket.io middleware refusal carrying a machine-readable code in `err.data`. */
 function socketError(code: string, message: string): Error & { data: { code: string } } {
@@ -41,14 +42,14 @@ const ipJoinLimiter = new SocketLimiter(60, 10_000);
 // Open /participant sockets per client IP: the rates above slow a flood down, this bounds it.
 const ipParticipantSockets = new ConcurrencyCap(MAX_PARTICIPANT_SOCKETS_PER_IP);
 
-/** Client IP as Caddy forwards it: the rightmost X-Forwarded-For entry (one trusted hop). */
+/** Client IP as Caddy forwards it: see clientIp (the same one-hop rule as REST). */
 function socketIp(socket: Socket): string {
   return clientIp(socket.handshake.headers, socket.handshake.address);
 }
 
 export const livePlugin = fp(
   async (app: FastifyInstance) => {
-    const publicUrl = app.config.PUBLIC_URL;
+    const origins = allowedOrigins(app.config.PUBLIC_URL, app.config.NODE_ENV === 'production');
     const io = new SocketIOServer(app.server, {
       path: '/socket.io',
       maxHttpBufferSize: 8 * 1024,
@@ -57,7 +58,7 @@ export const livePlugin = fp(
       transports: ['websocket', 'polling'],
       // Every handshake (both namespaces, both transports): a browser page from another origin must
       // not ride the admin's ambient cookie into /presenter. See isAllowedOrigin.
-      allowRequest: (req, callback) => callback(null, isAllowedOrigin(req.headers.origin, publicUrl)),
+      allowRequest: (req, callback) => callback(null, isAllowedOrigin(req.headers.origin, origins)),
     });
     app.decorate('io', io);
 
@@ -98,13 +99,12 @@ export const livePlugin = fp(
       // RATE_LIMITED, not a code of its own: the phone keeps its token and retries after a pause.
       const releaseSlot = ipParticipantSockets.acquire(ip);
       if (!releaseSlot) return next(socketError('RATE_LIMITED', errorMessage('RATE_LIMITED')));
-      // Freed on disconnect, on a refused handshake, or when the transport closes before the
-      // namespace connection happens (socket.io then fires no `disconnect` at all).
-      (socket.data as { releaseSlot?: () => void }).releaseSlot = releaseSlot;
+      // Freed (idempotently) on disconnect, on a refused handshake, or when the transport closes
+      // before the namespace connection happens (socket.io then fires no `disconnect` at all).
+      socket.once('disconnect', releaseSlot);
       socket.conn.once('close', releaseSlot);
       const refuse = (code: string, message = errorMessage(code)) => {
         releaseSlot();
-        socket.conn.off('close', releaseSlot);
         next(socketError(code, message));
       };
 
@@ -187,11 +187,6 @@ export const livePlugin = fp(
       socket.on('disconnect', () => {
         joinLimiter.release(socket.id);
         answerLimiter.release(socket.id);
-        const releaseSlot = (socket.data as { releaseSlot?: () => void }).releaseSlot;
-        if (releaseSlot) {
-          releaseSlot();
-          socket.conn.off('close', releaseSlot);
-        }
         const sessionId = (socket.data as { sessionId?: string }).sessionId;
         const participantId = (socket.data as { participantId?: string }).participantId;
         if (!sessionId || !participantId) return;
@@ -229,22 +224,20 @@ export const livePlugin = fp(
               : socketError('UNAUTHORIZED', 'Non authentifié'),
           );
         }
-        const payload = { sub: check.adminId };
-        (socket.data as { adminId: string }).adminId = payload.sub;
+        const { adminId } = check;
+        (socket.data as { adminId: string }).adminId = adminId;
         // Ownership from the row first: a non-owner must not be able to pull a session into memory.
         const row = await app.prisma.liveSession.findUnique({
           where: { id: sessionId },
           select: { presenterId: true },
         });
         if (!row) return next(socketError('SESSION_NOT_FOUND', 'Session inconnue'));
-        if (row.presenterId !== payload.sub) {
+        if (row.presenterId !== adminId) {
           return next(socketError('FORBIDDEN', 'Vous n’êtes pas le présentateur'));
         }
+        // presenterId is never updated, so the in-memory copy getOrLoad returns is the row's value.
         const s = await manager.getOrLoad(sessionId);
         if (!s) return next(socketError('SESSION_NOT_FOUND', 'Session inconnue'));
-        if (s.presenterId !== payload.sub) {
-          return next(socketError('FORBIDDEN', 'Vous n’êtes pas le présentateur'));
-        }
         socket.join(presenterRoom(sessionId));
         (socket.data as { sessionId?: string }).sessionId = sessionId;
         socket.emit('state:snapshot', await manager.presenterSnapshot(s));
@@ -259,18 +252,24 @@ export const livePlugin = fp(
       const getSession = () => manager.getOrLoad((socket.data as { sessionId?: string }).sessionId ?? '');
       socket.on('disconnect', () => commandLimiter.release(socket.id));
 
-      socket.on(
-        'session:start',
-        guarded('session:start', async (raw, ack) => {
-          if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
-          const parsed = SessionStartCommand.safeParse(raw ?? {});
-          const s = await getSession();
-          if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
-          const result = await manager.startSession(s, parsed.success ? !!parsed.data.force : false);
-          if (!result.ok) return ackErr(ack, result.code);
-          ackOk(ack);
-        }),
-      );
+      /** A presenter command: rate-limited per socket (§6.7) before anything else runs. */
+      const command = (event: string, handler: (raw: unknown, ack?: unknown) => Promise<unknown>) =>
+        socket.on(
+          event,
+          guarded(event, async (raw, ack) => {
+            if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
+            return handler(raw, ack);
+          }),
+        );
+
+      command('session:start', async (raw, ack) => {
+        const parsed = SessionStartCommand.safeParse(raw ?? {});
+        const s = await getSession();
+        if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
+        const result = await manager.startSession(s, parsed.success ? !!parsed.data.force : false);
+        if (!result.ok) return ackErr(ack, result.code);
+        ackOk(ack);
+      });
 
       // The four commands that carry `expectedIndex` (idempotence, §6.5) differ only by their schema
       // and the manager method they reach.
@@ -290,58 +289,42 @@ export const livePlugin = fp(
         ],
       ] as const;
       for (const [event, schema, run] of indexCommands) {
-        socket.on(
-          event,
-          guarded(event, async (raw, ack) => {
-            if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
-            const parsed = schema.safeParse(raw);
-            if (!parsed.success) return ackErr(ack, 'VALIDATION');
-            const s = await getSession();
-            if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
-            const result = await run(s, parsed.data.expectedIndex);
-            if (!result.ok) return ackErr(ack, result.code);
-            ackOk(ack);
-          }),
-        );
-      }
-
-      socket.on(
-        'session:end',
-        guarded('session:end', async (_raw, ack) => {
-          if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
-          const s = await getSession();
-          if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
-          await manager.endSession(s);
-          ackOk(ack);
-        }),
-      );
-
-      socket.on(
-        'participant:kick',
-        guarded('participant:kick', async (raw, ack) => {
-          if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
-          const parsed = ParticipantKickCommand.safeParse(raw);
+        command(event, async (raw, ack) => {
+          const parsed = schema.safeParse(raw);
           if (!parsed.success) return ackErr(ack, 'VALIDATION');
           const s = await getSession();
           if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
-          const result = await manager.kick(s, parsed.data.participantId);
+          const result = await run(s, parsed.data.expectedIndex);
           if (!result.ok) return ackErr(ack, result.code);
           ackOk(ack);
-        }),
-      );
+        });
+      }
 
-      socket.on(
-        'settings:update',
-        guarded('settings:update', async (raw, ack) => {
-          if (!commandLimiter.take(socket.id)) return ackErr(ack, 'RATE_LIMITED');
-          const parsed = SettingsUpdateCommand.safeParse(raw ?? {});
-          if (!parsed.success) return ackErr(ack, 'VALIDATION');
-          const s = await getSession();
-          if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
-          const settings = await manager.updateSettings(s, parsed.data);
-          ackOk(ack, { settings });
-        }),
-      );
+      command('session:end', async (_raw, ack) => {
+        const s = await getSession();
+        if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
+        await manager.endSession(s);
+        ackOk(ack);
+      });
+
+      command('participant:kick', async (raw, ack) => {
+        const parsed = ParticipantKickCommand.safeParse(raw);
+        if (!parsed.success) return ackErr(ack, 'VALIDATION');
+        const s = await getSession();
+        if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
+        const result = await manager.kick(s, parsed.data.participantId);
+        if (!result.ok) return ackErr(ack, result.code);
+        ackOk(ack);
+      });
+
+      command('settings:update', async (raw, ack) => {
+        const parsed = SettingsUpdateCommand.safeParse(raw ?? {});
+        if (!parsed.success) return ackErr(ack, 'VALIDATION');
+        const s = await getSession();
+        if (!s) return ackErr(ack, 'SESSION_NOT_FOUND');
+        const settings = await manager.updateSettings(s, parsed.data);
+        ackOk(ack, { settings });
+      });
     });
   },
   { name: 'live' },

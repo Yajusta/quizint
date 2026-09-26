@@ -19,7 +19,7 @@ import {
 import type { Env } from '../../config.js';
 import { asMediaKind, asPhase, asQuestionType } from '../../db/enums.js';
 import { apiError, joinUrl, slugify, validationError } from '../../lib/api.js';
-import { storedPlayedQuestionIds } from '../quizzes/routes.js';
+import { storedPlayedQuestionIds } from '../quizzes/played.js';
 import { buildAnswersCsv, buildScoresCsv } from './csv.js';
 
 function generateSessionCode(): string {

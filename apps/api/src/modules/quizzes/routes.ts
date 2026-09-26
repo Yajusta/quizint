@@ -14,6 +14,7 @@ import {
 } from '@quiz/shared';
 
 import { apiError, slugify, validationError } from '../../lib/api.js';
+import { loadPlayedQuestionIds } from './played.js';
 
 const DEFAULT_SETTINGS = QuizSettings.parse({});
 
@@ -21,14 +22,6 @@ const DEFAULT_SETTINGS = QuizSettings.parse({});
 function numericAnswerKey(raw: unknown): string | null {
   const n = raw as { value?: number; tolerance?: number; toleranceMode?: string } | null | undefined;
   return n ? `${n.value}|${n.tolerance ?? 0}|${n.toleranceMode ?? 'ABSOLUTE'}` : null;
-}
-
-/**
- * `Quiz.playedQuestionIds`: questions answered in a session since deleted. Written by the session
- * DELETE route before the answers cascade away, so the lock outlives them.
- */
-export function storedPlayedQuestionIds(raw: unknown): string[] {
-  return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === 'string') : [];
 }
 
 export async function quizRoutes(app: FastifyInstance): Promise<void> {
@@ -41,9 +34,7 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
    * not over still runs on the quiz.
    */
   const isQuizLocked = async (quiz: { id: string; playedQuestionIds: unknown }): Promise<boolean> =>
-    storedPlayedQuestionIds(quiz.playedQuestionIds).length > 0 ||
-    (await app.prisma.question.count({ where: { quizId: quiz.id, answers: { some: {} } } })) > 0 ||
-    (await hasLiveSession(quiz.id));
+    (await loadPlayedQuestionIds(app.prisma, quiz)).size > 0 || (await hasLiveSession(quiz.id));
 
   function getOwnedQuiz(quizId: string, adminId: string) {
     return app.prisma.quiz.findFirst({
@@ -371,19 +362,9 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
       // every answer of that round. While such a session exists, every existing question is locked.
       // Otherwise a question is played once answered, including in a session deleted since.
       const liveAtCheck = await hasLiveSession(quiz.id);
-      const playedQuestionIds = new Set(
-        liveAtCheck
-          ? quiz.questions.map((q) => q.id)
-          : [
-              ...storedPlayedQuestionIds(quiz.playedQuestionIds),
-              ...(
-                await app.prisma.question.findMany({
-                  where: { quizId: quiz.id, answers: { some: {} } },
-                  select: { id: true },
-                })
-              ).map((q) => q.id),
-            ],
-      );
+      const playedQuestionIds = liveAtCheck
+        ? new Set(quiz.questions.map((q) => q.id))
+        : await loadPlayedQuestionIds(app.prisma, quiz);
 
       // Locking rules (§3.2): played questions cannot be deleted, reordered, retyped, re-choice'd,
       // re-scored or given another correct answer.

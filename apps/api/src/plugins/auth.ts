@@ -102,7 +102,10 @@ async function plugin(app: FastifyInstance): Promise<void> {
     } catch {
       return { ok: false, reason: 'invalid' };
     }
-    if (loggedOutAccessTokens.has(sha256(token))) return { ok: false, reason: 'revoked' };
+    // Almost always empty: skip the hash then.
+    if (loggedOutAccessTokens.size > 0 && loggedOutAccessTokens.has(sha256(token))) {
+      return { ok: false, reason: 'revoked' };
+    }
     // A deactivated (or deleted) admin must lose access at once, not when the 15-min JWT expires:
     // one indexed lookup per request on a local SQLite file.
     const admin = await app.prisma.admin.findUnique({

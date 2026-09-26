@@ -1,7 +1,6 @@
 // Fastify app builder (no listen) — testable via fastify.inject().
 
 import { mkdirSync } from 'node:fs';
-import { BlockList, isIP } from 'node:net';
 import { resolve } from 'node:path';
 
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
@@ -10,6 +9,7 @@ import helmet from '@fastify/helmet';
 
 import { getConfig, usesDevJwtSecret } from './config.js';
 import { apiError } from './lib/api.js';
+import { trustCaddyHop } from './lib/proxy.js';
 import { authPlugin } from './plugins/auth.js';
 import { csrfGuard } from './plugins/csrf.js';
 import { prismaPlugin } from './plugins/prisma.js';
@@ -19,29 +19,6 @@ import { quizRoutes } from './modules/quizzes/routes.js';
 import { mediaRoutes, uploadsStaticPlugin } from './modules/media/routes.js';
 import { sessionRoutes } from './modules/sessions/routes.js';
 import { livePlugin } from './plugins/live.js';
-
-// Loopback and private ranges: where Caddy reaches the API from (the compose network, or localhost).
-const PRIVATE_PEERS = new BlockList();
-PRIVATE_PEERS.addSubnet('127.0.0.0', 8, 'ipv4');
-PRIVATE_PEERS.addSubnet('10.0.0.0', 8, 'ipv4');
-PRIVATE_PEERS.addSubnet('172.16.0.0', 12, 'ipv4');
-PRIVATE_PEERS.addSubnet('192.168.0.0', 16, 'ipv4');
-PRIVATE_PEERS.addAddress('::1', 'ipv6');
-PRIVATE_PEERS.addSubnet('fc00::', 7, 'ipv6');
-
-/**
- * Trust function for X-Forwarded-For: exactly one hop, Caddy's. `hop` 0 is the socket peer, trusted
- * only when it is a private address (a directly exposed API port answers with the real peer instead
- * of believing the header); the next address — the right-most XFF entry, which Caddy writes itself —
- * is never trusted, so it becomes req.ip. A client-supplied X-Forwarded-For can therefore never
- * choose the IP its rate-limit bucket is keyed on.
- */
-export function trustCaddyHop(address: string, hop: number): boolean {
-  if (hop !== 0) return false;
-  const ip = address.startsWith('::ffff:') ? address.slice('::ffff:'.length) : address;
-  const family = isIP(ip);
-  return family !== 0 && PRIVATE_PEERS.check(ip, family === 4 ? 'ipv4' : 'ipv6');
-}
 
 export async function buildApp(): Promise<FastifyInstance> {
   const config = getConfig();

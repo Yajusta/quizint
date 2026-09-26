@@ -295,9 +295,14 @@ export class SessionManager {
   /** Every derived view is stale: the answers, the participants or the question changed. */
   private invalidateDerived(s: LiveSessionState): void {
     this.roundCache.delete(s.sessionId);
-    this.rankingCache.delete(s.sessionId);
-    this.visibleRankingCache.delete(s.sessionId);
+    this.invalidateRankings(s.sessionId);
     s.finalCache = null;
+  }
+
+  /** Both ranking caches (full and answer-secret) go stale together. */
+  private invalidateRankings(sessionId: string): void {
+    this.rankingCache.delete(sessionId);
+    this.visibleRankingCache.delete(sessionId);
   }
 
   // --- Join / resume ----------------------------------------------------------------
@@ -367,8 +372,7 @@ export class SessionManager {
       s.participants.set(participant.id, participant);
       s.byNickname.set(participant.nicknameKey, participant.id);
       // A new row in the ranking the snapshots rank against (the stored round result keeps its own).
-      this.rankingCache.delete(s.sessionId);
-      this.visibleRankingCache.delete(s.sessionId);
+      this.invalidateRankings(s.sessionId);
 
       socket.join(participantsRoom(s.sessionId));
       socket.data.sessionId = s.sessionId;
@@ -727,8 +731,7 @@ export class SessionManager {
     if (s) this.clearIdleTimer(s);
     this.sessions.delete(sessionId);
     this.roundCache.delete(sessionId);
-    this.rankingCache.delete(sessionId);
-    this.visibleRankingCache.delete(sessionId);
+    this.invalidateRankings(sessionId);
     const progress = this.progress.get(sessionId);
     if (progress?.trailing) clearTimeout(progress.trailing);
     this.progress.delete(sessionId);

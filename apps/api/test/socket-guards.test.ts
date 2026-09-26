@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { ConcurrencyCap, clientIp, isAllowedOrigin } from '../src/modules/live/socket-guards.js';
+import { allowedOrigins } from '../src/plugins/csrf.js';
 
 describe('clientIp', () => {
   it('takes the rightmost X-Forwarded-For entry: the one the trusted proxy appended', () => {
@@ -17,15 +18,21 @@ describe('clientIp', () => {
     expect(clientIp({}, '10.0.0.2')).toBe('10.0.0.2');
     expect(clientIp({ 'x-forwarded-for': '' }, '10.0.0.2')).toBe('10.0.0.2');
   });
+
+  it('ignores the header from a public peer (a directly exposed port), like trustProxy', () => {
+    expect(clientIp({ 'x-forwarded-for': '203.0.113.7' }, '198.51.100.4')).toBe('198.51.100.4');
+  });
 });
 
 describe('isAllowedOrigin', () => {
-  const publicUrl = 'https://quiz.example.org';
+  const origins = allowedOrigins('https://quiz.example.org', true);
 
   it('accepts the app origin and a client sending no Origin at all', () => {
-    expect(isAllowedOrigin('https://quiz.example.org', publicUrl)).toBe(true);
-    expect(isAllowedOrigin(undefined, publicUrl)).toBe(true);
-    expect(isAllowedOrigin('https://quiz.example.org', 'https://quiz.example.org/some/path')).toBe(true);
+    expect(isAllowedOrigin('https://quiz.example.org', origins)).toBe(true);
+    expect(isAllowedOrigin(undefined, origins)).toBe(true);
+    expect(
+      isAllowedOrigin('https://quiz.example.org', allowedOrigins('https://quiz.example.org/some/path', true)),
+    ).toBe(true);
   });
 
   it('refuses any other origin, same-site siblings included', () => {
@@ -37,15 +44,18 @@ describe('isAllowedOrigin', () => {
       '',
       'not a url',
     ]) {
-      expect(isAllowedOrigin(origin, publicUrl)).toBe(false);
+      expect(isAllowedOrigin(origin, origins)).toBe(false);
     }
   });
 
-  it('folds the loopback aliases together but keeps the port', () => {
-    const dev = 'http://localhost:5173';
+  it('folds the loopback aliases together outside production, but keeps the port', () => {
+    const dev = allowedOrigins('http://localhost:5173', false);
     expect(isAllowedOrigin('http://127.0.0.1:5173', dev)).toBe(true);
     expect(isAllowedOrigin('http://[::1]:5173', dev)).toBe(true);
     expect(isAllowedOrigin('http://localhost:8081', dev)).toBe(false);
+    expect(isAllowedOrigin('http://127.0.0.1:5173', allowedOrigins('http://localhost:5173', true))).toBe(
+      false,
+    );
   });
 });
 

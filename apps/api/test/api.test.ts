@@ -16,7 +16,8 @@ import {
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
 
-import { buildApp, trustCaddyHop } from '../src/app.js';
+import { buildApp } from '../src/app.js';
+import { trustCaddyHop } from '../src/lib/proxy.js';
 import { getConfig } from '../src/config.js';
 import { JWT_AUDIENCE, JWT_ISSUER } from '../src/plugins/auth.js';
 import { allowedOrigins } from '../src/plugins/csrf.js';

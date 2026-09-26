@@ -3,6 +3,8 @@
 
 import type { IncomingHttpHeaders } from 'node:http';
 
+import { trustCaddyHop } from '../../lib/proxy.js';
+
 /** Simple token bucket keyed by socket id or client IP (§6.7). */
 export class SocketLimiter {
   private counts = new Map<string, { n: number; resetAt: number }>();
@@ -59,38 +61,26 @@ export class ConcurrencyCap {
 }
 
 /**
- * Client IP behind exactly one trusted proxy (Caddy, like `trustProxy: 1`): the RIGHTMOST
- * X-Forwarded-For entry is the address Caddy saw. Anything left of it came from the client and
- * is spoofable. Without the header, the socket's own address.
+ * Client IP by the same rule as REST (`trustCaddyHop`, Fastify's `trustProxy`): behind a private
+ * peer (Caddy), the RIGHTMOST X-Forwarded-For entry is the address Caddy saw — anything left of it
+ * came from the client and is spoofable. A public peer (a directly exposed port) or no header at
+ * all: the socket's own address.
  */
 export function clientIp(headers: IncomingHttpHeaders, address: string): string {
+  if (!trustCaddyHop(address, 0)) return address;
   const forwarded = headers['x-forwarded-for'];
   const last = (Array.isArray(forwarded) ? forwarded.at(-1) : forwarded)?.split(',').at(-1)?.trim();
   return last || address;
 }
 
-const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]']);
-
-/** `origin` of a URL with the loopback aliases folded together (dev opens either one). */
-function normalisedOrigin(url: string): string | null {
-  try {
-    const u = new URL(url);
-    if (LOOPBACK.has(u.hostname)) u.hostname = 'localhost';
-    return u.origin;
-  } catch {
-    return null;
-  }
-}
-
 /**
  * socket.io handshake Origin check (cookie-authenticated /presenter, same-site cross-origin pages).
  * A browser always sends `Origin` on a WebSocket upgrade and on a CORS polling request: when present,
- * it must be the app's own origin (PUBLIC_URL). No header at all is a non-browser client (the smoke
- * scripts, the tests, a native client) which carries no ambient cookie to abuse, so it passes.
+ * it must be one of `origins` — the CSRF guard's own set (`allowedOrigins`), so REST and sockets
+ * accept exactly the same pages. No header at all is a non-browser client (the smoke scripts, the
+ * tests, a native client) which carries no ambient cookie to abuse, so it passes.
  * The `cors` option alone would not do: socket.io does not apply it to the WebSocket upgrade.
  */
-export function isAllowedOrigin(origin: string | undefined, publicUrl: string): boolean {
-  if (origin === undefined) return true;
-  const expected = normalisedOrigin(publicUrl);
-  return expected !== null && normalisedOrigin(origin) === expected;
+export function isAllowedOrigin(origin: string | undefined, origins: ReadonlySet<string>): boolean {
+  return origin === undefined || origins.has(origin);
 }
