@@ -2,7 +2,7 @@
 
 import { z } from 'zod';
 
-import { ADMIN_PASSWORD_MIN_LENGTH } from '@quiz/shared';
+import { ADMIN_PASSWORD_MAX_LENGTH, ADMIN_PASSWORD_MIN_LENGTH } from '@quiz/shared';
 
 // Public, committed in .env.example: only ever acceptable outside production.
 const DEV_JWT_SECRET = 'dev-only-insecure-secret-change-me-32b!';
@@ -20,7 +20,7 @@ const EnvSchema = z
     PUBLIC_URL: z.string().url().default('http://localhost:5173'),
     UPLOADS_DIR: z.string().default('./uploads'),
     SEED_ADMIN_EMAIL: z.string().email().optional(),
-    SEED_ADMIN_PASSWORD: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).optional(),
+    SEED_ADMIN_PASSWORD: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).max(ADMIN_PASSWORD_MAX_LENGTH).optional(),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   })
   .superRefine((env, ctx) => {
@@ -45,6 +45,15 @@ const EnvSchema = z
   .transform((env) => ({ ...env, JWT_SECRET: env.JWT_SECRET ?? DEV_JWT_SECRET }));
 
 export type Env = z.infer<typeof EnvSchema>;
+
+/**
+ * True when the server signs with the public development secret, whether JWT_SECRET was left unset
+ * or copied from .env.example. Only possible outside production (the schema refuses it there);
+ * `buildApp` logs a warning at startup, since anyone can then forge an admin JWT.
+ */
+export function usesDevJwtSecret(env: Env): boolean {
+  return env.JWT_SECRET === DEV_JWT_SECRET;
+}
 
 let cached: Env | null = null;
 

@@ -39,6 +39,9 @@ export const POINTS_MAX = 10000;
 export const GRACE_MS = 500; // late-answer grace after questionClosesAt
 
 export const ADMIN_PASSWORD_MIN_LENGTH = 12;
+// Upper bound on every password field (login included): Argon2 hashes whatever it is given, so an
+// unbounded body would let one request burn CPU and memory on a multi-megabyte "password".
+export const ADMIN_PASSWORD_MAX_LENGTH = 256;
 
 export const UPLOAD_MAX_IMAGE_MB = 8;
 export const UPLOAD_MAX_AUDIO_MB = 15;

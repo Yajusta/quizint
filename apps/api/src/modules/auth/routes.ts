@@ -4,7 +4,13 @@ import type { FastifyInstance } from 'fastify';
 
 import { AdminCreateInput, AdminPatchInput, ChangePasswordInput, LoginInput } from '@quiz/shared';
 
-import { REFRESH_TOKEN_COOKIE, apiError, sha256, validationError } from '../../lib/api.js';
+import {
+  ACCESS_TOKEN_COOKIE,
+  REFRESH_TOKEN_COOKIE,
+  apiError,
+  sha256,
+  validationError,
+} from '../../lib/api.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
 
 function toAdminDTO(a: {
@@ -45,7 +51,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
       }
 
-      app.issueAccessToken(reply, admin.id, admin.email);
+      app.issueAccessToken(reply, admin);
       await app.issueRefreshToken(reply, admin.id);
       return { admin: toAdminDTO(admin) };
     },
@@ -63,13 +69,19 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       app.clearAuthCookies(reply);
       return reply.status(401).send(apiError('UNAUTHORIZED'));
     }
-    app.issueAccessToken(reply, admin.id, admin.email);
+    app.issueAccessToken(reply, admin);
+    // A replay inside the rotation grace gets an access token only (issueRefreshToken returns null):
+    // the refresh token minted by the first rotation is already in this browser's cookie jar, and a
+    // stolen copy must not mint a second, independent one (see REFRESH_ROTATION_GRACE_MS).
     await app.issueRefreshToken(reply, admin.id, req.cookies[REFRESH_TOKEN_COOKIE]);
     return { admin: toAdminDTO(admin) };
   });
 
   // --- POST /api/v1/auth/logout --------------------------------------------
   app.post('/auth/logout', async (req, reply) => {
+    // The access JWT dies with the logout too, not 15 min later: a copy of the cookie is useless.
+    const accessToken = req.cookies[ACCESS_TOKEN_COOKIE];
+    if (accessToken) app.revokeAccessToken(accessToken);
     const token = req.cookies[REFRESH_TOKEN_COOKIE];
     if (token) {
       // Hard revocation: expired too, so the rotation grace window cannot resurrect it.
@@ -133,13 +145,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         data: {
           ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
           ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
-          ...(parsed.data.password !== undefined
-            ? { passwordHash: await hashPassword(parsed.data.password) }
-            : {}),
         },
       });
-      // A reset password or a deactivation ends the account's sessions, whoever holds them.
-      if (parsed.data.password !== undefined || parsed.data.isActive === false) {
+      // A deactivation ends the account's sessions, whoever holds them. There is no password field
+      // here (AdminPatchInput is strict): nobody resets a colleague's password.
+      if (parsed.data.isActive === false) {
         await app.revokeAdminSessions(admin.id);
       }
       return { admin: toAdminDTO(admin) };
@@ -156,14 +166,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!admin) return reply.status(404).send(apiError('NOT_FOUND'));
     const ok = await verifyPassword(admin.passwordHash, parsed.data.currentPassword);
     if (!ok) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
-    await app.prisma.admin.update({
+    // passwordChangedAt is the credential version every access JWT carries: bumping it refuses all
+    // the JWTs signed before, this request's own included.
+    const updated = await app.prisma.admin.update({
       where: { id: admin.id },
-      data: { passwordHash: await hashPassword(parsed.data.newPassword) },
+      data: { passwordHash: await hashPassword(parsed.data.newPassword), passwordChangedAt: new Date() },
     });
-    // Every other session of this account ends (a stolen refresh cookie included); this browser
-    // gets fresh cookies so the admin who just changed their password stays signed in.
+    // Every other session of this account ends (a stolen refresh cookie or access JWT included);
+    // this browser gets fresh cookies so the admin who just changed their password stays signed in.
     await app.revokeAdminSessions(admin.id);
-    app.issueAccessToken(reply, admin.id, admin.email);
+    app.issueAccessToken(reply, updated);
     await app.issueRefreshToken(reply, admin.id, undefined);
     return reply.status(204).send();
   });

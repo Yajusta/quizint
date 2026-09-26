@@ -8,16 +8,19 @@ datasource db {
 }
 
 model Admin {
-  id            String        @id @default(uuid())
-  email         String        @unique
-  passwordHash  String
-  displayName   String
-  isActive      Boolean       @default(true)
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
-  quizzes       Quiz[]
-  sessions      LiveSession[]
-  refreshTokens RefreshToken[]
+  id                String         @id @default(uuid())
+  email             String         @unique
+  passwordHash      String
+  displayName       String
+  isActive          Boolean        @default(true)
+  // Credential version: set on every password change, carried by each access JWT (claim `pca`).
+  // A JWT whose claim differs was issued before the change and is refused.
+  passwordChangedAt DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  quizzes           Quiz[]
+  sessions          LiveSession[]
+  refreshTokens     RefreshToken[]
 }
 
 model RefreshToken {
