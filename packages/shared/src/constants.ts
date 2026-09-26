@@ -5,6 +5,13 @@ export const SESSION_CODE_LENGTH = 6;
 
 export const MAX_PARTICIPANTS_PER_SESSION = 500;
 export const MAX_JOINS_PER_SECOND_PER_SESSION = 30;
+/**
+ * Concurrent /participant sockets from one client IP. Deliberately a full room plus headroom, not a
+ * handful: a conference or a school behind one NAT is a whole room on a single address, and the seat
+ * cap, the join limits and the handshake rate already stop a script from filling a session. This one
+ * bounds what they do not: idle anonymous sockets piling up from one host without ever joining.
+ */
+export const MAX_PARTICIPANT_SOCKETS_PER_IP = MAX_PARTICIPANTS_PER_SESSION + 100;
 
 export const NICKNAME_MIN_LENGTH = 2;
 export const NICKNAME_MAX_LENGTH = 20;

@@ -24,6 +24,7 @@ import { sha256 } from '../src/lib/api.js';
 import { SessionManager } from '../src/modules/live/SessionManager.js';
 import type { FastifyInstance } from 'fastify';
 import type { Socket } from 'socket.io';
+import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
 
 const TEST_EMAIL = 'test-admin@example.fr';
 const TEST_PASSWORD = 'test-password-12';
@@ -1885,6 +1886,228 @@ describe('live engine', () => {
     });
     expect(gone.statusCode).toBe(204);
     expect((await del()).statusCode).toBe(204);
+  });
+
+  const loadedIds = () => (app.sessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
+  const forget = (id: string) =>
+    (app.sessionManager as unknown as { forget: (id: string) => void }).forget(id);
+
+  it('a resume snapshot keeps score and rank off the open question until it closes (no answer oracle)', async () => {
+    const quiz = await createQuiz('Quiz oracle', [mcq(), mcq()]);
+    const { code, s } = await createLiveSession(quiz.id);
+    const lea = await joinAs(code, 'Léa');
+    const tom = await joinAs(code, 'Tom');
+    const choice = (i: number, correct: boolean) =>
+      s.quizSnapshot.questions[i]!.choices.find((c) => c.isCorrect === correct)!.id;
+    await app.sessionManager.startSession(s, false);
+    // Q1: Léa right, Tom wrong → Léa 100, Tom 0.
+    await app.sessionManager.submitAnswer(s, lea.participant, 0, { choiceId: choice(0, true) });
+    await app.sessionManager.submitAnswer(s, tom.participant, 0, { choiceId: choice(0, false) });
+    await app.sessionManager.closeQuestionCommand(s, 0);
+    await app.sessionManager.nextQuestion(s, 0);
+
+    // Q2 open: Tom right, Léa wrong. What each phone reads on resume must not move.
+    await app.sessionManager.submitAnswer(s, tom.participant, 1, { choiceId: choice(1, true) });
+    await app.sessionManager.submitAnswer(s, lea.participant, 1, { choiceId: choice(1, false) });
+    const resumeSnapshot = async (token: string, socketId: string) => {
+      const resumed = await app.sessionManager.resumeByToken(fakeSocket(socketId), token);
+      if (!resumed.ok) throw new Error(resumed.code);
+      return app.sessionManager.participantSnapshot(resumed.s, resumed.participant);
+    };
+    const tomOpen = await resumeSnapshot(tom.token, 'sock-tom-2');
+    const leaOpen = await resumeSnapshot(lea.token, 'sock-lea-2');
+    expect(tomOpen.phase).toBe('QUESTION_OPEN');
+    expect(tomOpen.you).toMatchObject({ score: 0, rank: 2 });
+    expect(leaOpen.you).toMatchObject({ score: 100, rank: 1 });
+    expect(tomOpen.question?.alreadyAnswered).toBe(true);
+    // The presenter keeps the live scores.
+    const live = (await app.sessionManager.presenterSnapshot(s)).participants;
+    expect(live.find((p) => p.id === tom.participant.id)?.score).toBe(100);
+
+    // After question:closed, the new standings show.
+    await app.sessionManager.closeQuestionCommand(s, 1);
+    const tomClosed = await resumeSnapshot(tom.token, 'sock-tom-3');
+    expect(tomClosed.you.score).toBe(100);
+    expect(tomClosed.roundResult).toMatchObject({ totalScore: 100, pointsAwarded: 100 });
+  });
+
+  it('an answer queued behind a close and a reopen is refused, not scored against the new opening', async () => {
+    const quiz = await createQuiz('Quiz file d’attente', [mcq({ timeLimitSec: 30, speedBonusMax: 500 })]);
+    const { code, s } = await createLiveSession(quiz.id);
+    const { participant } = await joinAs(code, 'Rapide');
+    const late = await joinAs(code, 'Tardif');
+    await app.sessionManager.startSession(s, false);
+    const right = s.quizSnapshot.questions[0]!.choices.find((c) => c.isCorrect)!.id;
+
+    // Sent to the first opening, it reaches the lock only after the close and the reopen.
+    const close = app.sessionManager.closeQuestionCommand(s, 0);
+    const reopen = app.sessionManager.reopenQuestion(s, 0);
+    const queued = app.sessionManager.submitAnswer(s, participant, 0, { choiceId: right });
+    expect(await close).toEqual({ ok: true });
+    expect(await reopen).toEqual({ ok: true });
+    expect(await queued).toMatchObject({ ok: false, code: 'QUESTION_CLOSED' });
+    expect(participant.answers.has(0)).toBe(false);
+
+    // Sent while the result was showing, queued behind a reopen: refused as well.
+    await app.sessionManager.closeQuestionCommand(s, 0);
+    const reopened = app.sessionManager.reopenQuestion(s, 0);
+    const early = app.sessionManager.submitAnswer(s, late.participant, 0, { choiceId: right });
+    expect(await reopened).toEqual({ ok: true });
+    expect(await early).toMatchObject({ ok: false, code: 'QUESTION_CLOSED' });
+
+    // An answer sent to the current opening is still accepted.
+    expect(await app.sessionManager.submitAnswer(s, participant, 0, { choiceId: right })).toMatchObject({
+      ok: true,
+    });
+    await app.sessionManager.endSession(s); // stops the auto-close timer
+  });
+
+  it('joining an ENDED session is refused without loading it back into memory', async () => {
+    const quiz = await createQuiz('Quiz terminé', [mcq()]);
+    const { sessionId, code, s } = await createLiveSession(quiz.id);
+    await app.sessionManager.endSession(s);
+    forget(sessionId);
+    const result = await app.sessionManager.join(fakeSocket('sock-late'), code, 'Retard');
+    expect(result).toMatchObject({ ok: false, code: 'SESSION_CLOSED_TO_JOIN' });
+    expect(loadedIds().has(sessionId)).toBe(false);
+  });
+
+  it('a session deleted while not loaded cannot be rebuilt in memory by a concurrent load', async () => {
+    const quiz = await createQuiz('Quiz suppression concurrente', [mcq()]);
+    const { sessionId, s } = await createLiveSession(quiz.id);
+    await app.sessionManager.endSession(s);
+    forget(sessionId);
+    // A delete held open long enough for a load to read the row it is about to remove.
+    let releaseDelete = () => {};
+    const gate = new Promise<void>((resolve) => (releaseDelete = resolve));
+    const liveSession = new Proxy(app.prisma.liveSession, {
+      get(delegate, method) {
+        if (method !== 'delete') return bound(delegate, method);
+        return async (args: Parameters<typeof delegate.delete>[0]) => {
+          await gate;
+          return delegate.delete(args);
+        };
+      },
+    });
+    const manager = new SessionManager(
+      app.io,
+      prismaWith({ liveSession }),
+      () => 'http://localhost',
+      app.log,
+    );
+    const deleted = manager.deleteSession(sessionId);
+    await new Promise((resolve) => setImmediate(resolve)); // the delete now waits on the gate
+    const loaded = await manager.getOrLoad(sessionId);
+    releaseDelete();
+    await deleted;
+    expect(loaded).toBeNull();
+    expect((manager as unknown as { sessions: Map<string, unknown> }).sessions.has(sessionId)).toBe(false);
+  });
+
+  describe('socket handshakes', () => {
+    let base = '';
+    const opened: ClientSocket[] = [];
+
+    beforeAll(async () => {
+      await app.listen({ port: 0, host: '127.0.0.1' });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('no port');
+      base = `http://127.0.0.1:${address.port}`;
+    });
+
+    afterAll(() => {
+      for (const socket of opened) socket.close();
+    });
+
+    /** Resolves 'connected' or the refusal: `data.code` for a middleware one, the message otherwise. */
+    const handshake = (
+      namespace: string,
+      opts: { origin?: string; transport?: 'websocket' | 'polling'; auth?: object; cookie?: string } = {},
+    ) =>
+      new Promise<string>((resolve) => {
+        const headers: Record<string, string> = {};
+        if (opts.origin) headers.origin = opts.origin;
+        if (opts.cookie) headers.cookie = opts.cookie;
+        const socket = ioClient(`${base}${namespace}`, {
+          transports: [opts.transport ?? 'websocket'],
+          extraHeaders: headers,
+          auth: opts.auth ?? {},
+          reconnection: false,
+          forceNew: true,
+        });
+        opened.push(socket);
+        socket.on('connect', () => resolve('connected'));
+        socket.on('connect_error', (err: Error & { data?: { code?: string } }) =>
+          resolve(err.data?.code ?? err.message),
+        );
+      });
+
+    it('refuses a browser handshake from another origin, on both transports', async () => {
+      const quiz = await createQuiz('Quiz origine', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      const presenter = { auth: { sessionId }, cookie: cookies };
+      // PUBLIC_URL defaults to http://localhost:5173 (the Vite dev server, which forwards Origin as is).
+      for (const transport of ['websocket', 'polling'] as const) {
+        expect(await handshake('/participant', { origin: 'http://localhost:5173', transport })).toBe(
+          'connected',
+        );
+        expect(await handshake('/participant', { origin: 'http://127.0.0.1:5173', transport })).toBe(
+          'connected',
+        );
+        expect(await handshake('/participant', { transport })).toBe('connected'); // no Origin: not a browser
+        expect(
+          await handshake('/presenter', { ...presenter, origin: 'http://localhost:5173', transport }),
+        ).toBe('connected');
+        for (const origin of [
+          'http://localhost:8081',
+          'https://localhost:5173',
+          'http://evil.example',
+          'null',
+        ]) {
+          // Refused by the engine before any namespace middleware: no refusal code, a transport error.
+          const participant = await handshake('/participant', { origin, transport });
+          const stage = await handshake('/presenter', { ...presenter, origin, transport });
+          expect([participant, stage]).toEqual([
+            expect.stringMatching(/error/i),
+            expect.stringMatching(/error/i),
+          ]);
+        }
+      }
+    });
+
+    it('refuses a malformed resume token', async () => {
+      expect(await handshake('/participant', { auth: { token: { $ne: '' } } })).toBe('TOKEN_INVALID');
+      expect(await handshake('/participant', { auth: { token: 'x'.repeat(4096) } })).toBe('TOKEN_INVALID');
+    });
+
+    it('checks the presenter owns the session before loading it', async () => {
+      const quiz = await createQuiz('Quiz présentateur', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      forget(sessionId);
+      const other = 'other-presenter@example.fr';
+      await app.prisma.admin.upsert({
+        where: { email: other },
+        update: {},
+        create: { email: other, displayName: 'Autre', passwordHash: await hash(TEST_PASSWORD) },
+      });
+      try {
+        const login = await app.inject({
+          method: 'POST',
+          url: '/api/v1/auth/login',
+          payload: { email: other, password: TEST_PASSWORD },
+        });
+        const otherCookie = setCookieOf(login);
+        expect(await handshake('/presenter', { auth: { sessionId }, cookie: otherCookie })).toBe('FORBIDDEN');
+        expect(loadedIds().has(sessionId)).toBe(false);
+        expect(await handshake('/presenter', { auth: { sessionId: 'nope' }, cookie: cookies })).toBe(
+          'SESSION_NOT_FOUND',
+        );
+        expect(await handshake('/presenter', { auth: { sessionId }, cookie: cookies })).toBe('connected');
+        expect(loadedIds().has(sessionId)).toBe(true);
+      } finally {
+        await app.prisma.admin.delete({ where: { email: other } }).catch(() => undefined);
+      }
+    });
   });
 });
 

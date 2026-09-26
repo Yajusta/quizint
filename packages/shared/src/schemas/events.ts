@@ -353,11 +353,14 @@ export type ParticipantKickCommand = z.infer<typeof ParticipantKickCommand>;
 export const SettingsUpdateCommand = LiveSessionSettingsPatch;
 export type SettingsUpdateCommand = z.infer<typeof SettingsUpdateCommand>;
 
-// Handshake auth payloads
-export const ParticipantResumeAuth = z.object({ token: z.string().min(20) });
+// Handshake auth payloads. A participant handshake without `token` is anonymous (it will
+// `participant:join`); one with a malformed token is refused TOKEN_INVALID.
+export const ParticipantResumeAuth = z.object({
+  token: z.string().regex(/^[A-Za-z0-9_-]{20,128}$/, 'Jeton invalide'), // base64url, 43 chars as issued
+});
 export type ParticipantResumeAuth = z.infer<typeof ParticipantResumeAuth>;
 
-export const PresenterAttachAuth = z.object({ sessionId: z.string() });
+export const PresenterAttachAuth = z.object({ sessionId: z.string().uuid() });
 export type PresenterAttachAuth = z.infer<typeof PresenterAttachAuth>;
 
 // ---------------------------------------------------------------------------

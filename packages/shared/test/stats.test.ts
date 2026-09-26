@@ -8,6 +8,7 @@ import {
   buildNumericDistribution,
   buildQuestionDistribution,
   buildRanking,
+  buildVisibleRanking,
   correctAnswerFor,
   podiumFrom,
   type StatsAnswer,
@@ -121,6 +122,70 @@ describe('buildRanking', () => {
   it('handles negative scores correctly', () => {
     const ranking = buildRanking(participants, answers);
     expect(ranking[ranking.length - 1]?.score).toBe(-25);
+  });
+});
+
+describe('buildVisibleRanking', () => {
+  // Scores already include question 1, still open: Léa answered it right (1500), Tom wrong (0).
+  const live: StatsParticipant[] = [
+    { participantId: 'lea', nickname: 'Léa', score: 1600, isKicked: false, joinedAt: 2 },
+    { participantId: 'tom', nickname: 'Tom', score: 200, isKicked: false, joinedAt: 1 },
+  ];
+  const liveAnswers: StatsAnswer[] = [
+    {
+      participantId: 'lea',
+      questionIndex: 0,
+      payload: { choiceId: 'a' },
+      isCorrect: true,
+      pointsAwarded: 100,
+      elapsedMs: 9000,
+    },
+    {
+      participantId: 'tom',
+      questionIndex: 0,
+      payload: { choiceId: 'a' },
+      isCorrect: true,
+      pointsAwarded: 200,
+      elapsedMs: 1000,
+    },
+    {
+      participantId: 'lea',
+      questionIndex: 1,
+      payload: { choiceId: 'b' },
+      isCorrect: true,
+      pointsAwarded: 1500,
+      elapsedMs: 10,
+    },
+    {
+      participantId: 'tom',
+      questionIndex: 1,
+      payload: { choiceId: 'c' },
+      isCorrect: false,
+      pointsAwarded: 0,
+      elapsedMs: 20,
+    },
+  ];
+
+  it('leaves the open question out of every score and rank', () => {
+    const visible = buildVisibleRanking(live, liveAnswers, 1);
+    expect(visible.map((r) => [r.nickname, r.score, r.rank])).toEqual([
+      ['Tom', 200, 1],
+      ['Léa', 100, 2],
+    ]);
+    // Its answer times do not break ties either.
+    expect(visible.map((r) => r.totalCorrectElapsedMs)).toEqual([1000, 9000]);
+  });
+
+  it('is the plain ranking when no question is open', () => {
+    expect(buildVisibleRanking(live, liveAnswers, null)).toEqual(buildRanking(live, liveAnswers));
+  });
+
+  it('shows the same standings whatever was answered to the open question', () => {
+    const swapped = liveAnswers.map((a) =>
+      a.questionIndex === 1 ? { ...a, isCorrect: !a.isCorrect, pointsAwarded: a.isCorrect ? 0 : 1500 } : a,
+    );
+    const swappedLive = live.map((p) => ({ ...p, score: p.participantId === 'lea' ? 100 : 1700 }));
+    expect(buildVisibleRanking(swappedLive, swapped, 1)).toEqual(buildVisibleRanking(live, liveAnswers, 1));
   });
 });
 

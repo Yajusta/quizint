@@ -106,6 +106,33 @@ export function buildRanking(
   return rows;
 }
 
+/**
+ * The ranking as a participant may see it. While question `openQuestionIndex` is open, its points
+ * and its answer times are left out of every row: a score or a rank that moved right after an answer
+ * would tell whether it was correct before `question:closed` (answer secrecy). `null` when no
+ * question is open: the plain `buildRanking`. The presenter keeps the live ranking.
+ */
+export function buildVisibleRanking(
+  participants: ReadonlyArray<StatsParticipant>,
+  answers: ReadonlyArray<StatsAnswer>,
+  openQuestionIndex: number | null,
+): RankingRow[] {
+  if (openQuestionIndex === null) return buildRanking(participants, answers);
+  const pending = new Map<string, number>();
+  const settled: StatsAnswer[] = [];
+  for (const a of answers) {
+    if (a.questionIndex === openQuestionIndex) {
+      pending.set(a.participantId, (pending.get(a.participantId) ?? 0) + a.pointsAwarded);
+    } else {
+      settled.push(a);
+    }
+  }
+  return buildRanking(
+    participants.map((p) => ({ ...p, score: p.score - (pending.get(p.participantId) ?? 0) })),
+    settled,
+  );
+}
+
 export interface PodiumRow {
   rank: number;
   nickname: string;
