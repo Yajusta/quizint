@@ -1,9 +1,40 @@
 import { describe, expect, it } from 'vitest';
 
-import { QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
+import { ADMIN_PASSWORD_MAX_LENGTH, QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
 import { LiveSessionSettings, LiveSessionSettingsPatch, QuizExportV1 } from '../src/schemas/domain.js';
-import { SettingsUpdateCommand } from '../src/schemas/events.js';
-import { QuizCreateInput, QuizPatchInput } from '../src/schemas/rest.js';
+import { ParticipantResumeAuth, PresenterAttachAuth, SettingsUpdateCommand } from '../src/schemas/events.js';
+import {
+  AdminCreateInput,
+  AdminPatchInput,
+  ChangePasswordInput,
+  LoginInput,
+  QuizCreateInput,
+  QuizPatchInput,
+} from '../src/schemas/rest.js';
+
+describe('admin credentials', () => {
+  it('AdminPatchInput is strict and carries no password (no colleague reset)', () => {
+    expect(AdminPatchInput.safeParse({ password: 'a-new-password-12' }).success).toBe(false);
+    expect(AdminPatchInput.safeParse({ isActive: false, extra: 1 }).success).toBe(false);
+    expect(AdminPatchInput.parse({ displayName: ' Ada ', isActive: true })).toEqual({
+      displayName: 'Ada',
+      isActive: true,
+    });
+  });
+
+  it('every password field is bounded by ADMIN_PASSWORD_MAX_LENGTH', () => {
+    const max = 'x'.repeat(ADMIN_PASSWORD_MAX_LENGTH);
+    const over = `${max}x`;
+    const email = 'a@example.fr';
+    expect(LoginInput.safeParse({ email, password: max }).success).toBe(true);
+    expect(LoginInput.safeParse({ email, password: over }).success).toBe(false);
+    expect(AdminCreateInput.safeParse({ email, displayName: 'A', password: max }).success).toBe(true);
+    expect(AdminCreateInput.safeParse({ email, displayName: 'A', password: over }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: over, newPassword: max }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: over }).success).toBe(false);
+    expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: max }).success).toBe(true);
+  });
+});
 
 describe('settings patches', () => {
   it('LiveSessionSettings fills the defaults of absent flags', () => {
@@ -56,5 +87,23 @@ describe('QuizExportV1', () => {
     // Regression: an import above the cap created a quiz the editor could never save again.
     expect(QuizExportV1.safeParse(file(QUESTIONS_PER_QUIZ_MAX)).success).toBe(true);
     expect(QuizExportV1.safeParse(file(QUESTIONS_PER_QUIZ_MAX + 1)).success).toBe(false);
+  });
+});
+
+describe('handshake auth', () => {
+  it('ParticipantResumeAuth takes a base64url token as issued and nothing else', () => {
+    expect(ParticipantResumeAuth.safeParse({ token: 'A'.repeat(43) }).success).toBe(true);
+    expect(ParticipantResumeAuth.safeParse({ token: 'abc_-DEF0123456789xyz' }).success).toBe(true);
+    for (const token of ['short', 'A'.repeat(129), 'a b'.repeat(10), 42, { $ne: '' }]) {
+      expect(ParticipantResumeAuth.safeParse({ token }).success).toBe(false);
+    }
+  });
+
+  it('PresenterAttachAuth takes a session UUID', () => {
+    const id = '3f73c70e-6dea-440a-a479-3a8da9f9f909';
+    expect(PresenterAttachAuth.safeParse({ sessionId: id }).success).toBe(true);
+    for (const sessionId of [undefined, '', 'not-a-uuid', 7, [id]]) {
+      expect(PresenterAttachAuth.safeParse({ sessionId }).success).toBe(false);
+    }
   });
 });

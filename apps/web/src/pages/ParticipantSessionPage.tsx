@@ -43,7 +43,7 @@ export function ParticipantSessionPage() {
     let cancelled = false;
     setJoinStatus('loading');
     setQuizInfo(null);
-    fetch(`/api/v1/join/${code}`)
+    fetch(`/api/v1/join/${encodeURIComponent(code)}`)
       .then(async (r) => {
         if (r.status === 404) {
           if (!cancelled) setJoinStatus('notfound');

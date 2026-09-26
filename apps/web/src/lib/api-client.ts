@@ -17,6 +17,18 @@ export class ApiErrorThrown extends Error {
   }
 }
 
+/**
+ * Tagged template for API paths: every interpolated value is percent-encoded as one segment (or one
+ * query value), so a route param such as `..%2F..` or `a/b` can never retarget the request.
+ * Usage: apiPath`/quizzes/${id}/sessions`.
+ */
+export function apiPath(strings: TemplateStringsArray, ...values: ReadonlyArray<string | number>): string {
+  return strings.reduce((acc, part, i) => {
+    const value = values[i];
+    return acc + part + (value === undefined ? '' : encodeURIComponent(String(value)));
+  }, '');
+}
+
 let refreshInFlight: Promise<void> | null = null;
 
 /** Rotates the session cookies; one shared refresh at a time, never rejects. */

@@ -41,7 +41,7 @@ pnpm --filter @quiz/api dev      # API en watch
 pnpm --filter @quiz/api test     # tests d'intégration API (base SQLite jetable, recréée à chaque run)
 pnpm --filter @quiz/api check:scores  # cohérence scores vs SUM(réponses)
 node apps/api/test/load-smoke.mjs 200  # smoke de charge (cf. docs/LOAD.md)
-pnpm --filter @quiz/shared mock:live    # serveur mock du protocole (dev front)
+pnpm --filter @quiz/shared mock:live    # serveur mock du protocole (dev front), sur 127.0.0.1 sauf MOCK_HOST
 pnpm --filter @quiz/shared docs:protocol # régénère docs/PROTOCOL.md
 pnpm --filter @quiz/web test:e2e        # captures Playwright -> docs/screens/<surface>/
 ```
@@ -105,11 +105,13 @@ Caddy sert le front statique et proxifie `/api`, `/socket.io`, `/uploads` vers l
 
 Un étage dédié installe les seules dépendances de production (`--prod`), ce qui écarte vitest, tsx, esbuild et pino-pretty de l'image finale. `@prisma/client` et la CLI `prisma` sont des besoins d'exécution — l'entrypoint applique les migrations au démarrage — et figurent donc en `dependencies`. Les builds sont reproductibles : le lockfile et tous les manifestes du workspace sont copiés, et l'installation est gelée (`--frozen-lockfile`). La base SQLite vit dans un volume Docker nommé (`file:/data/db/quiz.db`) — jamais sur un montage NFS ou réseau.
 
+`PUBLIC_URL` doit être l'origine exacte qu'utilisent les navigateurs : l'API refuse les requêtes REST non sûres et les handshakes socket.io dont l'`Origin` diffère (protection CSRF). En développement, tester depuis un téléphone du réseau local suppose donc de renseigner cette adresse locale dans `PUBLIC_URL` (`apps/api/.env`). Caddy ajoute les en-têtes de sécurité et une Content-Security-Policy stricte sur chaque route, et plafonne la taille des corps de requête ; le plafond de `/api` suit `UPLOAD_MAX_AUDIO_MB` (`packages/shared/src/constants.ts`), à relever ensemble. Les images de base sont épinglées par tag et digest sha256 (la procédure de mise à jour est commentée dans chaque Dockerfile) et l'image de l'API requiert BuildKit. Un seed en échec arrête le conteneur de l'API au lieu de le démarrer sans administrateur utilisable.
+
 ## Qualité
 
 - TypeScript strict (`noUncheckedIndexedAccess`), ESLint 9, Prettier.
 - Règles métier = fonctions pures couvertes à 100 % par les tests de `packages/shared`.
-- Anti-triche : les payloads participants n'exposent jamais les bonnes réponses (test automatique de non-fuite + vérifié dans les tests d'intégration).
+- Anti-triche : les payloads participants n'exposent jamais les bonnes réponses (test automatique de non-fuite + vérifié dans les tests d'intégration), et le score comme le rang d'un participant ignorent la question ouverte jusqu'à sa clôture.
 - Commandes idempotentes (`expectedIndex`) : double-clic présentateur ignoré.
 - Reprenez où vous étiez : reconnexion socket avec token, snapshot complet resynchronisé.
 

@@ -5,6 +5,22 @@ export const SESSION_CODE_LENGTH = 6;
 
 export const MAX_PARTICIPANTS_PER_SESSION = 500;
 export const MAX_JOINS_PER_SECOND_PER_SESSION = 30;
+/**
+ * Concurrent /participant sockets from one client IP. Deliberately a full room plus headroom, not a
+ * handful: a conference or a school behind one NAT is a whole room on a single address, and the seat
+ * cap, the join limits and the handshake rate already stop a script from filling a session. This one
+ * bounds what they do not: idle anonymous sockets piling up from one host without ever joining.
+ */
+export const MAX_PARTICIPANT_SOCKETS_PER_IP = MAX_PARTICIPANTS_PER_SESSION + 100;
+
+/**
+ * Participant resume token: `randomBytes(PARTICIPANT_TOKEN_BYTES)` in base64url (43 chars as issued by
+ * the API; the mock server issues a 36-char UUID). The handshake schema accepts base64url within these
+ * bounds and refuses anything else as TOKEN_INVALID.
+ */
+export const PARTICIPANT_TOKEN_BYTES = 32;
+export const PARTICIPANT_TOKEN_MIN_LENGTH = 20;
+export const PARTICIPANT_TOKEN_MAX_LENGTH = 128;
 
 export const NICKNAME_MIN_LENGTH = 2;
 export const NICKNAME_MAX_LENGTH = 20;
@@ -39,6 +55,9 @@ export const POINTS_MAX = 10000;
 export const GRACE_MS = 500; // late-answer grace after questionClosesAt
 
 export const ADMIN_PASSWORD_MIN_LENGTH = 12;
+// Upper bound on every password field (login included): Argon2 hashes whatever it is given, so an
+// unbounded body would let one request burn CPU and memory on a multi-megabyte "password".
+export const ADMIN_PASSWORD_MAX_LENGTH = 256;
 
 export const UPLOAD_MAX_IMAGE_MB = 8;
 export const UPLOAD_MAX_AUDIO_MB = 15;
@@ -58,3 +77,18 @@ export const CLOCK_SYNC_SAMPLES = 5;
 // A–F letters of the choices. Answer boxes are deliberately identical: no colour per choice,
 // the letter is the only marker (§8.5).
 export const CHOICE_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'] as const;
+
+// Upload hardening (security audit, lot C).
+/**
+ * Decoded-pixel cap handed to sharp (`limitInputPixels`), checked from the header before any
+ * decode: a decompression bomb (a few kB of PNG claiming 50 000 × 50 000) is refused instead of
+ * allocating gigabytes. 40 MP stays above anything an admin legitimately uploads (a 24 MP camera
+ * photo, an 8K frame at 33 MP) while bounding a decode to ~160 MB of RGBA, far under sharp's own
+ * default of 268 MP. For an animated GIF the count covers every frame (width × height × pages).
+ */
+export const IMAGE_MAX_INPUT_PIXELS = 40_000_000;
+/** Multipart bounds of POST /media: one file, a couple of stray fields at most, tiny values. */
+export const UPLOAD_MULTIPART_MAX_FILES = 1;
+export const UPLOAD_MULTIPART_MAX_FIELDS = 4;
+export const UPLOAD_MULTIPART_MAX_PARTS = 5;
+export const UPLOAD_MULTIPART_MAX_FIELD_SIZE = 1024; // bytes per non-file field value

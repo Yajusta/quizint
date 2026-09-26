@@ -8,16 +8,19 @@ datasource db {
 }
 
 model Admin {
-  id            String        @id @default(uuid())
-  email         String        @unique
-  passwordHash  String
-  displayName   String
-  isActive      Boolean       @default(true)
-  createdAt     DateTime      @default(now())
-  updatedAt     DateTime      @updatedAt
-  quizzes       Quiz[]
-  sessions      LiveSession[]
-  refreshTokens RefreshToken[]
+  id                String         @id @default(uuid())
+  email             String         @unique
+  passwordHash      String
+  displayName       String
+  isActive          Boolean        @default(true)
+  // Credential version: set on every password change, carried by each access JWT (claim `pca`).
+  // A JWT whose claim differs was issued before the change and is refused.
+  passwordChangedAt DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  quizzes           Quiz[]
+  sessions          LiveSession[]
+  refreshTokens     RefreshToken[]
 }
 
 model RefreshToken {
@@ -42,6 +45,9 @@ model Quiz {
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   archivedAt  DateTime? // hidden from the library, restorable; only an archived quiz can be deleted
+  // string[] of question ids that were answered in a session since deleted (RGPD): the answers
+  // cascade away with the session, the lock on those questions must not (423 QUIZ_LOCKED).
+  playedQuestionIds Json?
   questions   Question[]
   sessions    LiveSession[]
 

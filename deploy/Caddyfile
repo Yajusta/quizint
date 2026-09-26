@@ -1,23 +1,68 @@
 {$DOMAIN} {
 	encode zstd gzip
 
+	# Security headers on every response — SPA, API, uploads and socket.io alike. `defer` applies
+	# them once the upstream has answered and *replaces* what the API (helmet) already sent, so
+	# no header is duplicated and Caddy's value always wins.
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		X-Frame-Options DENY
+		Cross-Origin-Opener-Policy same-origin
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+		-Server
+		defer
+	}
+
+	# REST API. The body cap covers the largest accepted upload — UPLOAD_MAX_AUDIO_MB (15 MiB) in
+	# packages/shared/src/constants.ts — plus the multipart envelope. Raise both together.
 	handle /api/* {
+		request_body {
+			max_size 16MiB
+		}
+		# `allow-downloads`: the CSV/JSON exports are opened in a new tab as attachment downloads, which
+		# a bare `sandbox` may block. Scripts, forms and popups stay forbidden, so a JSON body still
+		# renders inert.
+		header {
+			Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; sandbox allow-downloads"
+			Cross-Origin-Resource-Policy same-origin
+			defer
+		}
 		reverse_proxy api:3000
 	}
+
+	# socket.io: WebSocket frames carry no request body; HTTP long-polling payloads are capped at
+	# 8 KiB by the server (maxHttpBufferSize), so 64 KiB is ample.
 	handle /socket.io/* {
+		request_body {
+			max_size 64KiB
+		}
 		reverse_proxy api:3000
 	}
+
+	# Uploaded media, fetched same-origin by the SPA as <img>/<audio> sources. The CSP only
+	# governs a direct navigation to the file (it never applies to a subresource load), so it
+	# allows the file to render itself and nothing else.
 	handle /uploads/* {
+		request_body {
+			max_size 64KiB
+		}
+		header {
+			Content-Security-Policy "default-src 'none'; img-src 'self'; media-src 'self'; frame-ancestors 'none'; sandbox"
+			Cross-Origin-Resource-Policy same-origin
+			defer
+		}
 		reverse_proxy api:3000
 	}
+
 	handle {
+		request_body {
+			max_size 64KiB
+		}
 		root * /srv/web
 		try_files {path} /index.html
 		file_server
-		header Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss: ws:; font-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+		header Content-Security-Policy "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' wss: ws:; font-src 'self'; style-src 'self' 'unsafe-inline'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
 	}
-
-	header Strict-Transport-Security "max-age=31536000"
-	header X-Content-Type-Options nosniff
-	header Referrer-Policy no-referrer
 }

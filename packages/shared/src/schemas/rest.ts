@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 import {
   ADMIN_DISPLAY_NAME_MAX_LENGTH,
+  ADMIN_PASSWORD_MAX_LENGTH,
   ADMIN_PASSWORD_MIN_LENGTH,
   QUESTIONS_PER_QUIZ_MAX,
   QUIZ_DESCRIPTION_MAX_LENGTH,
@@ -34,27 +35,31 @@ export type AdminDTO = z.infer<typeof AdminDTO>;
 
 export const LoginInput = z.object({
   email: z.string().email(),
-  password: z.string().min(1),
+  password: z.string().min(1).max(ADMIN_PASSWORD_MAX_LENGTH),
 });
 export type LoginInput = z.infer<typeof LoginInput>;
 
 export const AdminCreateInput = z.object({
   email: z.string().email(),
   displayName: z.string().trim().min(1).max(ADMIN_DISPLAY_NAME_MAX_LENGTH),
-  password: z.string().min(ADMIN_PASSWORD_MIN_LENGTH),
+  password: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).max(ADMIN_PASSWORD_MAX_LENGTH),
 });
 export type AdminCreateInput = z.infer<typeof AdminCreateInput>;
 
-export const AdminPatchInput = z.object({
-  displayName: z.string().trim().min(1).max(ADMIN_DISPLAY_NAME_MAX_LENGTH).optional(),
-  isActive: z.boolean().optional(),
-  password: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).optional(),
-});
+// No `password` here: an admin changes their own password through /auth/change-password (current
+// password required), and nobody resets a colleague's. Strict, so a body that still sends one is a
+// 400 rather than a silently ignored field.
+export const AdminPatchInput = z
+  .object({
+    displayName: z.string().trim().min(1).max(ADMIN_DISPLAY_NAME_MAX_LENGTH).optional(),
+    isActive: z.boolean().optional(),
+  })
+  .strict();
 export type AdminPatchInput = z.infer<typeof AdminPatchInput>;
 
 export const ChangePasswordInput = z.object({
-  currentPassword: z.string().min(1),
-  newPassword: z.string().min(ADMIN_PASSWORD_MIN_LENGTH),
+  currentPassword: z.string().min(1).max(ADMIN_PASSWORD_MAX_LENGTH),
+  newPassword: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).max(ADMIN_PASSWORD_MAX_LENGTH),
 });
 export type ChangePasswordInput = z.infer<typeof ChangePasswordInput>;
 

@@ -2,7 +2,11 @@
 
 import { z } from 'zod';
 
-import { SESSION_CODE_LENGTH } from '../constants.js';
+import {
+  PARTICIPANT_TOKEN_MAX_LENGTH,
+  PARTICIPANT_TOKEN_MIN_LENGTH,
+  SESSION_CODE_LENGTH,
+} from '../constants.js';
 import {
   AnswerPayload,
   AnswerSubmission,
@@ -353,11 +357,18 @@ export type ParticipantKickCommand = z.infer<typeof ParticipantKickCommand>;
 export const SettingsUpdateCommand = LiveSessionSettingsPatch;
 export type SettingsUpdateCommand = z.infer<typeof SettingsUpdateCommand>;
 
-// Handshake auth payloads
-export const ParticipantResumeAuth = z.object({ token: z.string().min(20) });
+// Handshake auth payloads. A participant handshake without `token` is anonymous (it will
+// `participant:join`); one with a malformed token is refused TOKEN_INVALID.
+export const ParticipantResumeAuth = z.object({
+  token: z
+    .string()
+    .min(PARTICIPANT_TOKEN_MIN_LENGTH, 'Jeton invalide')
+    .max(PARTICIPANT_TOKEN_MAX_LENGTH, 'Jeton invalide')
+    .regex(/^[A-Za-z0-9_-]+$/, 'Jeton invalide'), // base64url
+});
 export type ParticipantResumeAuth = z.infer<typeof ParticipantResumeAuth>;
 
-export const PresenterAttachAuth = z.object({ sessionId: z.string() });
+export const PresenterAttachAuth = z.object({ sessionId: z.string().uuid() });
 export type PresenterAttachAuth = z.infer<typeof PresenterAttachAuth>;
 
 // ---------------------------------------------------------------------------

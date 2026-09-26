@@ -41,7 +41,7 @@ pnpm --filter @quiz/api dev      # API in watch mode
 pnpm --filter @quiz/api test     # API integration tests (disposable SQLite DB, recreated on each run)
 pnpm --filter @quiz/api check:scores  # score consistency check vs SUM(answers)
 node apps/api/test/load-smoke.mjs 200  # load smoke test (see docs/LOAD.md)
-pnpm --filter @quiz/shared mock:live    # protocol mock server (frontend dev)
+pnpm --filter @quiz/shared mock:live    # protocol mock server (frontend dev), 127.0.0.1 only unless MOCK_HOST is set
 pnpm --filter @quiz/shared docs:protocol # regenerate docs/PROTOCOL.md
 pnpm --filter @quiz/web test:e2e        # Playwright screenshots -> docs/screens/<surface>/
 ```
@@ -105,11 +105,13 @@ Caddy serves the static frontend and reverse proxies `/api`, `/socket.io`, and `
 
 A dedicated stage installs only production dependencies (`--prod`), excluding vitest, tsx, esbuild, and pino-pretty from the final image. `@prisma/client` and the `prisma` CLI are runtime requirements — the entrypoint applies migrations on startup — and are therefore listed under `dependencies`. Builds are reproducible: the lockfile and all workspace manifests are copied, and installation is frozen (`--frozen-lockfile`). The SQLite database resides in a named Docker volume (`file:/data/db/quiz.db`) — never on an NFS or network mount.
 
+`PUBLIC_URL` must be the exact origin browsers use: the API refuses unsafe REST requests and socket.io handshakes whose `Origin` differs (CSRF protection). In development, testing from a phone on the LAN therefore means setting `PUBLIC_URL` in `apps/api/.env` to that LAN address. Caddy adds security headers and a strict Content-Security-Policy on every route and caps request bodies; the `/api` cap follows `UPLOAD_MAX_AUDIO_MB` (`packages/shared/src/constants.ts`), so raise both together. Base images are pinned by tag and sha256 digest (the bump procedure is commented in each Dockerfile) and the API image needs BuildKit. A failing seed stops the API container instead of starting it without a usable admin.
+
 ## Quality
 
 - Strict TypeScript (`noUncheckedIndexedAccess`), ESLint 9, Prettier.
 - Business rules = pure functions with 100% test coverage in `packages/shared`.
-- Anti-cheat: participant payloads never leak correct answers (automated leak prevention tests + verified via integration tests).
+- Anti-cheat: participant payloads never leak correct answers (automated leak prevention tests + verified via integration tests), and a participant's score and rank leave out the open question until it closes.
 - Idempotent commands (`expectedIndex`): presenter double-clicks are ignored.
 - Resume where you left off: socket reconnection with token, full state snapshot resynchronized.
 

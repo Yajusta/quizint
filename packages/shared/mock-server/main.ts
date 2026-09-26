@@ -33,6 +33,7 @@ import {
   buildFinalStats,
   buildQuestionDistribution,
   buildRanking,
+  buildVisibleRanking,
   canTransition,
   correctAnswerFor,
   GRACE_MS,
@@ -59,6 +60,9 @@ import {
 import { FIXTURE_QUIZ_SHOWCASE, FIXTURE_QUIZ_SNAPSHOT } from '../test/fixtures.js';
 
 const PORT = Number(process.env.MOCK_PORT ?? 4001);
+// Loopback by default: the mock accepts any presenter without authentication, so it must not be
+// reachable from the LAN unless someone opts in explicitly (MOCK_HOST=0.0.0.0).
+const HOST = process.env.MOCK_HOST ?? '127.0.0.1';
 const PUBLIC_URL = process.env.MOCK_PUBLIC_URL ?? 'http://localhost:5173';
 
 type FixtureKind = 'demo' | 'showcase';
@@ -205,6 +209,10 @@ function socketsByParticipant(): Map<string, Socket[]> {
 function buildParticipantSnapshot(s: MockSession, p: MockParticipant) {
   const q = currentQuestion(s);
   const ranking = rankingOf(s);
+  // Like the API: while a question is open, its points stay out of the participant's score and rank.
+  const openIndex = s.phase === 'QUESTION_OPEN' ? s.currentQuestionIndex : null;
+  const visible = buildVisibleRanking(statsParticipants(s), statsAnswers(s), openIndex);
+  const you = visible.find((r) => r.participantId === p.id);
   const view: ParticipantQuestionView | null = q ? toParticipantQuestionView(q) : null;
   const answer = q ? p.answers.get(s.currentQuestionIndex) : undefined;
   return {
@@ -214,7 +222,12 @@ function buildParticipantSnapshot(s: MockSession, p: MockParticipant) {
     phase: s.phase,
     questionIndex: s.currentQuestionIndex,
     totalQuestions: s.quizSnapshot.questions.length,
-    you: { participantId: p.id, nickname: p.nickname, score: p.score, rank: participantRank(ranking, p.id) },
+    you: {
+      participantId: p.id,
+      nickname: p.nickname,
+      score: you?.score ?? 0,
+      rank: participantRank(visible, p.id),
+    },
     participantCount: ranking.length,
     question:
       view && s.phase === 'QUESTION_OPEN'
@@ -883,6 +896,6 @@ presenterNs.on('connection', (socket: Socket) => {
   }
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`[mock] live server on http://localhost:${PORT} (socket.io path /socket.io)`);
+httpServer.listen(PORT, HOST, () => {
+  console.log(`[mock] live server on http://${HOST}:${PORT} (socket.io path /socket.io)`);
 });

@@ -10,7 +10,7 @@ import { z } from 'zod';
 
 import { SessionCreatedDTO } from '@quiz/shared';
 
-import { apiJson, ApiErrorThrown } from '../../lib/api-client.ts';
+import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { formatDate, formatNumber, formatShortDate, NBSP } from '../../lib/format.ts';
 import { Badge, Button, Card, EmptyState, Icon, IconButton } from '../../design-system/index.ts';
 import { GridSkeleton } from '../../components/Skeletons.tsx';
@@ -72,7 +72,7 @@ export function DashboardPage() {
     if (launching.current) return;
     launching.current = true;
     try {
-      const created = await apiJson.post(`/quizzes/${quizId}/sessions`, {}, SessionCreatedDTO);
+      const created = await apiJson.post(apiPath`/quizzes/${quizId}/sessions`, {}, SessionCreatedDTO);
       navigate(`/present/${created.sessionId}`);
     } catch (e) {
       setError(e instanceof ApiErrorThrown ? e.message : t('errors.launch'));
@@ -84,7 +84,7 @@ export function DashboardPage() {
   // Reversible (« Quiz archivés » page): no confirmation, the card disappears at once.
   const archive = async (quizId: string) => {
     try {
-      await apiJson.post(`/quizzes/${quizId}/archive`, {}, z.unknown());
+      await apiJson.post(apiPath`/quizzes/${quizId}/archive`, {}, z.unknown());
       setQuizzes((list) => list.filter((q) => q.id !== quizId));
       setError(null);
     } catch (e) {

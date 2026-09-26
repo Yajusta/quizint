@@ -2,20 +2,30 @@
 // The test database is a throwaway file recreated from scratch by the `pretest` script on every run.
 // Run: pnpm --filter @quiz/api test   (DATABASE_URL is set by vitest.config.ts, no .env needed)
 
+import { crc32, deflateSync } from 'node:zlib';
+
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hash } from 'argon2';
+import { createHmac } from 'node:crypto';
 
 import {
+  ADMIN_PASSWORD_MAX_LENGTH,
   ENDED_PURGE_DELAY_MS,
+  IMAGE_MAX_INPUT_PIXELS,
   MAX_JOINS_PER_SECOND_PER_SESSION,
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
 
 import { buildApp } from '../src/app.js';
+import { trustCaddyHop } from '../src/lib/proxy.js';
+import { getConfig } from '../src/config.js';
+import { JWT_AUDIENCE, JWT_ISSUER } from '../src/plugins/auth.js';
+import { allowedOrigins } from '../src/plugins/csrf.js';
 import { sha256 } from '../src/lib/api.js';
 import { SessionManager } from '../src/modules/live/SessionManager.js';
 import type { FastifyInstance } from 'fastify';
 import type { Socket } from 'socket.io';
+import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
 
 const TEST_EMAIL = 'test-admin@example.fr';
 const TEST_PASSWORD = 'test-password-12';
@@ -49,6 +59,67 @@ describe('health', () => {
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ status: 'ok' });
+  });
+});
+
+describe('probe app', () => {
+  // A second app, so test-only routes can be added before it is ready. It runs before any session
+  // exists, so its boot load has nothing to pick up from the shared database.
+  let probe: FastifyInstance;
+  const ips: string[] = [];
+  beforeAll(async () => {
+    probe = await buildApp();
+    probe.get('/ip', async (req) => {
+      ips.push(req.ip);
+      return {};
+    });
+    probe.get('/boom', async () => {
+      throw new Error('Invalid `prisma.admin.findMany()` invocation: no such column: Admin.passwordHash');
+    });
+    probe.get('/teapot', async () => {
+      throw Object.assign(new Error('short and stout'), { statusCode: 418 });
+    });
+    await probe.ready();
+  }, 30000);
+  afterAll(() => probe.close());
+
+  it('a 5xx answers the generic INTERNAL envelope, never the raw error message', async () => {
+    const res = await probe.inject({ method: 'GET', url: '/boom' });
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toEqual({ error: { code: 'INTERNAL', message: 'Erreur interne' } });
+    expect(res.body).not.toContain('prisma');
+  });
+
+  it('a 4xx keeps the answer Fastify gives it', async () => {
+    const teapot = await probe.inject({ method: 'GET', url: '/teapot' });
+    expect(teapot.statusCode).toBe(418);
+    expect(teapot.json().message).toBe('short and stout');
+    const badJson = await probe.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      headers: { 'content-type': 'application/json' },
+      payload: '{"email":',
+    });
+    expect(badJson.statusCode).toBe(400);
+    expect(badJson.json().code).toBe('FST_ERR_CTP_INVALID_JSON_BODY');
+  });
+
+  it('a spoofed X-Forwarded-For does not choose the client IP', async () => {
+    // Behind Caddy: the right-most entry, the one Caddy wrote, whatever the client prepended.
+    await probe.inject({
+      method: 'GET',
+      url: '/ip',
+      remoteAddress: '172.18.0.3',
+      headers: { 'x-forwarded-for': '1.2.3.4, 198.51.100.7' },
+    });
+    // A directly reachable port: the header is not believed at all.
+    await probe.inject({
+      method: 'GET',
+      url: '/ip',
+      remoteAddress: '203.0.113.50',
+      headers: { 'x-forwarded-for': '1.2.3.4' },
+    });
+    expect(ips).toEqual(['198.51.100.7', '203.0.113.50']);
   });
 });
 
@@ -106,7 +177,10 @@ describe('auth', () => {
       app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: first }),
     ]);
     expect([a.statusCode, b.statusCode]).toEqual([200, 200]);
-    const rotated = cookiesObject(setCookieOf(a));
+    // One token in, one successor out: only the winner sets a refresh cookie, the loser an access one.
+    const hasRefresh = (r: typeof a) => r.cookies.some((c) => c.name === 'refresh_token');
+    expect([a, b].filter(hasRefresh)).toHaveLength(1);
+    const rotated = cookiesObject(setCookieOf(hasRefresh(a) ? a : b));
     const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: rotated });
     expect(me.statusCode).toBe(200);
 
@@ -146,12 +220,14 @@ describe('auth', () => {
     });
     const replay = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: first });
     expect(replay.statusCode).toBe(200);
+    // …with an access token only: the grace never mints a second refresh token.
+    expect(replay.cookies.map((c) => c.name)).toEqual(['access_token']);
     // …but does not move the revocation time: the window closes 10 s after the *first* rotation.
     const row = await app.prisma.refreshToken.findUniqueOrThrow({ where: { tokenHash: firstHash } });
     expect(row.revokedAt?.getTime()).toBe(sixSecondsAgo.getTime());
 
     // Logout expires the cookie outright: no grace, a replay is refused at once.
-    const current = cookiesObject(setCookieOf(replay));
+    const current = { ...cookiesObject(setCookieOf(rotate)), ...cookiesObject(setCookieOf(replay)) };
     expect(
       (await app.inject({ method: 'POST', url: '/api/v1/auth/logout', cookies: current })).statusCode,
     ).toBe(204);
@@ -471,6 +547,139 @@ describe('media', () => {
     expect(del.statusCode).toBe(204);
   });
 
+  it('a percent-encoded media path still requires authentication; /uploads stays public', async () => {
+    const boundary = 'vitest-boundary-anon';
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    const payload = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="x.gif"\r\n` +
+          'Content-Type: image/gif\r\n\r\n',
+      ),
+      gif,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const headers = { 'content-type': `multipart/form-data; boundary=${boundary}` };
+    const before = await app.prisma.media.count();
+    for (const url of ['/api/v1/media', '/api/v1/%6Dedia', '/api/v1/m%65dia', '/api/v1/%6D%65dia']) {
+      const res = await app.inject({ method: 'POST', url, headers, payload });
+      expect(res.statusCode, url).toBe(401);
+    }
+    for (const url of [
+      '/api/v1/media/00000000-0000-4000-8000-000000000000',
+      '/api/v1/%6Dedia/00000000-0000-4000-8000-000000000000',
+    ]) {
+      const res = await app.inject({ method: 'DELETE', url });
+      expect(res.statusCode, url).toBe(401);
+    }
+    expect(await app.prisma.media.count()).toBe(before);
+    // The static route is outside the media plugin's guard: a missing file is a 404, not a 401.
+    const statics = await app.inject({ method: 'GET', url: '/uploads/does-not-exist.webp' });
+    expect(statics.statusCode).toBe(404);
+  });
+
+  /** Multipart body from raw parts: `file` parts carry a filename, the others are plain fields. */
+  const multipartBody = (
+    boundary: string,
+    parts: Array<{ name: string; value: Buffer | string; filename?: string }>,
+  ) =>
+    Buffer.concat([
+      ...parts.flatMap((p) => [
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${p.name}"` +
+            (p.filename ? `; filename="${p.filename}"\r\nContent-Type: application/octet-stream` : '') +
+            '\r\n\r\n',
+        ),
+        Buffer.isBuffer(p.value) ? p.value : Buffer.from(p.value),
+        Buffer.from('\r\n'),
+      ]),
+      Buffer.from(`--${boundary}--\r\n`),
+    ]);
+  const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  const upload = (boundary: string, payload: Buffer) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/media',
+      cookies: cookiesObject(cookies),
+      headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+      payload,
+    });
+
+  it('stray fields and a first file under another name are drained, not left hanging', async () => {
+    const boundary = 'vitest-boundary-drain';
+    const res = await upload(
+      boundary,
+      multipartBody(boundary, [
+        { name: 'note', value: 'bonjour' },
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+        { name: 'after', value: 'ignored' },
+      ]),
+    );
+    expect(res.statusCode).toBe(201);
+    await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/media/${res.json().media.id}`,
+      cookies: cookiesObject(cookies),
+    });
+
+    // A file under another field name is drained; the request then ends with no "file": 400.
+    const other = await upload(
+      boundary,
+      multipartBody(boundary, [{ name: 'avatar', value: gifBytes, filename: 'b.gif' }]),
+    );
+    expect(other.statusCode).toBe(400);
+  });
+
+  it('multipart bounds: a second file or too many parts is a 413', async () => {
+    const boundary = 'vitest-boundary-limits';
+    const twoFiles = await upload(
+      boundary,
+      multipartBody(boundary, [
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+        { name: 'file', value: gifBytes, filename: 'b.gif' },
+      ]),
+    );
+    expect(twoFiles.statusCode).toBe(413);
+    const manyFields = await upload(
+      boundary,
+      multipartBody(boundary, [
+        ...Array.from({ length: 10 }, (_, i) => ({ name: `f${i}`, value: 'x' })),
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+      ]),
+    );
+    expect(manyFields.statusCode).toBe(413);
+  });
+
+  it('an image whose header claims more than IMAGE_MAX_INPUT_PIXELS is refused before decoding', async () => {
+    // A valid PNG signature and IHDR claiming 10 000 × 10 000 (100 MP), then an empty IDAT:
+    // sharp reads the size from the header and refuses before allocating anything.
+    const chunk = (type: string, data: Buffer) => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(data.length);
+      const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+      const crc = Buffer.alloc(4);
+      crc.writeUInt32BE(crc32(body));
+      return Buffer.concat([len, body, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(10_000, 0);
+    ihdr.writeUInt32BE(10_000, 4);
+    ihdr.set([8, 2, 0, 0, 0], 8); // 8-bit RGB, no interlace
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      chunk('IHDR', ihdr),
+      chunk('IDAT', deflateSync(Buffer.alloc(0))),
+      chunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect(10_000 * 10_000).toBeGreaterThan(IMAGE_MAX_INPUT_PIXELS);
+    const boundary = 'vitest-boundary-bomb';
+    const res = await upload(
+      boundary,
+      multipartBody(boundary, [{ name: 'file', value: png, filename: 'b.png' }]),
+    );
+    expect(res.statusCode).toBe(415);
+    expect(res.json().error.code).toBe('MEDIA_UNSUPPORTED_TYPE');
+  });
+
   it('a question pointing at a media the library no longer holds is a 400 naming the question', async () => {
     const before = await app.inject({
       method: 'GET',
@@ -558,6 +767,14 @@ describe('account security', () => {
       payload: { currentPassword: TEST_PASSWORD, newPassword: TEST_PASSWORD },
     });
     expect(changed.statusCode).toBe(204);
+    // Every access JWT signed before the change is refused at once, this browser's previous one
+    // included — most likely signed in the very same second, which `iat` alone could not tell apart —
+    // while the one change-password just handed back works.
+    const me = (c: Record<string, string>) =>
+      app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: c });
+    expect((await me(other)).statusCode).toBe(401);
+    expect((await me(mine)).statusCode).toBe(401);
+    expect((await me(cookiesObject(setCookieOf(changed)))).statusCode).toBe(200);
     // The other browser's refresh token is revoked; this browser got fresh cookies.
     expect(
       (await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: other })).statusCode,
@@ -570,6 +787,182 @@ describe('account security', () => {
     expect(refreshed.statusCode).toBe(200);
     // The suite keeps these (no extra login: the login route allows 10 per minute and per IP).
     cookies = setCookieOf(refreshed);
+  });
+});
+
+describe('auth hardening', () => {
+  // Logins from their own documentation-range addresses: the login route allows 10 per minute and
+  // per IP, and the suite above already spends most of 127.0.0.1's budget.
+  let nextIp = 1;
+  const loginFrom = (email = TEST_EMAIL, password = TEST_PASSWORD) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `203.0.113.${nextIp++}`,
+      payload: { email, password },
+    });
+  const me = (c: Record<string, string>) => app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: c });
+  const b64url = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+  /** Hand-signed JWT, to try what our own signer never produces. */
+  const forge = (header: Record<string, unknown>, claims: Record<string, unknown>, hmac = 'sha256') => {
+    const input = `${b64url(header)}.${b64url(claims)}`;
+    const sig = createHmac(hmac, getConfig().JWT_SECRET).update(input).digest('base64url');
+    return `${input}.${sig}`;
+  };
+
+  it('PATCH /admins/:id refuses a password: nobody resets a colleague’s password', async () => {
+    const self = (await me(cookiesObject(cookies))).json().admin.id as string;
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/v1/admins/${self}`,
+      cookies: cookiesObject(cookies),
+      payload: { password: 'thief-chosen-password-33' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error.code).toBe('VALIDATION');
+    // Nothing was written: the suite's password still signs in.
+    expect((await loginFrom()).statusCode).toBe(200);
+  });
+
+  it('a password longer than ADMIN_PASSWORD_MAX_LENGTH is a 400 on every route', async () => {
+    const long = 'x'.repeat(ADMIN_PASSWORD_MAX_LENGTH + 1);
+    const login = await loginFrom(TEST_EMAIL, long);
+    expect(login.statusCode).toBe(400);
+    expect(login.json().error.code).toBe('INVALID_CREDENTIALS');
+    const create = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admins',
+      cookies: cookiesObject(cookies),
+      payload: { email: 'long@example.fr', displayName: 'Long', password: long },
+    });
+    expect(create.statusCode).toBe(400);
+    const change = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/change-password',
+      cookies: cookiesObject(cookies),
+      payload: { currentPassword: TEST_PASSWORD, newPassword: long },
+    });
+    expect(change.statusCode).toBe(400);
+  });
+
+  it('an access JWT with another algorithm, issuer or audience is refused', async () => {
+    const admin = await app.prisma.admin.findUniqueOrThrow({ where: { email: TEST_EMAIL } });
+    const now = Math.floor(Date.now() / 1000);
+    const claims = {
+      sub: admin.id,
+      email: admin.email,
+      jti: 'forged',
+      ...(admin.passwordChangedAt ? { pca: admin.passwordChangedAt.getTime() } : {}),
+      iat: now,
+      exp: now + 60,
+      iss: JWT_ISSUER,
+      aud: JWT_AUDIENCE,
+    };
+    const hs256 = { alg: 'HS256', typ: 'JWT' };
+    const withToken = (token: string) => me({ access_token: token });
+    // Control: the helper does produce a token the API accepts.
+    expect((await withToken(forge(hs256, claims))).statusCode).toBe(200);
+    expect((await withToken(forge({ alg: 'HS512', typ: 'JWT' }, claims, 'sha512'))).statusCode).toBe(401);
+    expect((await withToken(`${b64url({ alg: 'none', typ: 'JWT' })}.${b64url(claims)}.`)).statusCode).toBe(
+      401,
+    );
+    expect((await withToken(forge(hs256, { ...claims, iss: 'someone-else' }))).statusCode).toBe(401);
+    expect((await withToken(forge(hs256, { ...claims, aud: 'someone-else' }))).statusCode).toBe(401);
+    // Absent claims, not just wrong ones (fast-jwt would skip the check of a missing claim).
+    for (const missing of ['iss', 'aud', 'exp'] as const) {
+      const partial: Record<string, unknown> = { ...claims };
+      delete partial[missing];
+      expect((await withToken(forge(hs256, partial))).statusCode).toBe(401);
+    }
+  });
+
+  it('logout ends the access JWT too, not 15 min later', async () => {
+    const session = cookiesObject(setCookieOf(await loginFrom()));
+    expect((await me(session)).statusCode).toBe(200);
+    const out = await app.inject({ method: 'POST', url: '/api/v1/auth/logout', cookies: session });
+    expect(out.statusCode).toBe(204);
+    expect((await me(session)).statusCode).toBe(401);
+    // Only that token: the suite's own session is untouched.
+    expect((await me(cookiesObject(cookies))).statusCode).toBe(200);
+  });
+
+  it('a stolen refresh token replayed inside the grace window mints no independent refresh token', async () => {
+    const stolen = cookiesObject(setCookieOf(await loginFrom()));
+    const { id: adminId } = (await me(stolen)).json().admin as { id: string };
+    // The legitimate browser rotates first…
+    const legit = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(legit.statusCode).toBe(200);
+    const live = () => app.prisma.refreshToken.count({ where: { adminId, revokedAt: null } });
+    const before = await live();
+    // …then the thief replays the copy within the grace: an access token, no refresh cookie, no row.
+    const replay = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.cookies.some((c) => c.name === 'refresh_token')).toBe(false);
+    expect(await live()).toBe(before);
+    // Once the grace is over, the same replay is theft: the whole family goes, legit browser included.
+    await app.prisma.refreshToken.update({
+      where: { tokenHash: sha256(stolen.refresh_token!) },
+      data: { revokedAt: new Date(Date.now() - 60_000) },
+    });
+    const late = await app.inject({ method: 'POST', url: '/api/v1/auth/refresh', cookies: stolen });
+    expect(late.statusCode).toBe(401);
+    const legitAgain = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/refresh',
+      cookies: cookiesObject(setCookieOf(legit)),
+    });
+    expect(legitAgain.statusCode).toBe(401);
+    // Restore the suite's cookies (the family revocation took them too).
+    cookies = setCookieOf(await loginFrom());
+  });
+
+  describe('CSRF', () => {
+    const rename = async (headers: Record<string, string>) => {
+      const self = (await me(cookiesObject(cookies))).json().admin.id as string;
+      return app.inject({
+        method: 'PATCH',
+        url: `/api/v1/admins/${self}`,
+        cookies: cookiesObject(cookies),
+        headers,
+        payload: { displayName: 'Test' },
+      });
+    };
+
+    it('a cross-site or same-site browser request is refused', async () => {
+      for (const site of ['cross-site', 'same-site']) {
+        const res = await rename({ 'sec-fetch-site': site, origin: 'http://localhost:5173' });
+        expect(res.statusCode).toBe(403);
+        expect(res.json().error.code).toBe('FORBIDDEN');
+      }
+      // A browser without Fetch Metadata: the Origin alone decides.
+      expect((await rename({ origin: 'https://evil.example' })).statusCode).toBe(403);
+      expect((await rename({ origin: 'null' })).statusCode).toBe(403);
+    });
+
+    it('the app’s own origin, a typed URL and a non-browser client pass', async () => {
+      expect(
+        (await rename({ 'sec-fetch-site': 'same-origin', origin: 'http://localhost:5173' })).statusCode,
+      ).toBe(200);
+      // Vite listens on 127.0.0.1: outside production the loopback aliases of PUBLIC_URL are the app too.
+      expect((await rename({ origin: 'http://127.0.0.1:5173' })).statusCode).toBe(200);
+      expect((await rename({ 'sec-fetch-site': 'none' })).statusCode).toBe(200);
+      expect((await rename({})).statusCode).toBe(200);
+    });
+
+    it('only the origin of PUBLIC_URL is allowed in production', () => {
+      expect([...allowedOrigins('https://quiz.example.fr/', true)]).toEqual(['https://quiz.example.fr']);
+      expect(allowedOrigins('http://localhost:5173', true).has('http://127.0.0.1:5173')).toBe(false);
+      expect(allowedOrigins('http://localhost:5173', false).has('http://127.0.0.1:5173')).toBe(true);
+      expect(allowedOrigins('https://quiz.example.fr', false).size).toBe(1);
+    });
+  });
+
+  it('X-Forwarded-For is believed for exactly one hop, and only from a private peer', () => {
+    expect(trustCaddyHop('172.18.0.3', 0)).toBe(true); // Caddy on the compose network
+    expect(trustCaddyHop('::ffff:172.18.0.3', 0)).toBe(true);
+    expect(trustCaddyHop('127.0.0.1', 0)).toBe(true);
+    expect(trustCaddyHop('172.18.0.3', 1)).toBe(false); // the entry Caddy wrote is the client
+    expect(trustCaddyHop('203.0.113.9', 0)).toBe(false); // a directly exposed port: header ignored
   });
 });
 
@@ -1125,6 +1518,145 @@ describe('live engine', () => {
     expect(res.json().error.details.reason).toBe('correct answer changed');
   });
 
+  it('deleting the played session keeps the quiz locked; duplication stays the escape hatch', async () => {
+    const quiz = await createQuiz('Quiz joué puis purgé', [mcq(), numeric()]);
+    const { sessionId, code, s } = await createLiveSession(quiz.id);
+    const { participant } = await joinAs(code, 'Rgpd');
+    await app.sessionManager.startSession(s, false);
+    const choiceId = s.quizSnapshot.questions[0]!.choices[0]!.id;
+    expect((await app.sessionManager.submitAnswer(s, participant, 0, { choiceId })).ok).toBe(true);
+
+    // Deleted while still running: the route ends it, records the answered question, then deletes.
+    const gone = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/sessions/${sessionId}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(gone.statusCode).toBe(204);
+    expect(await app.prisma.answer.count({ where: { sessionId } })).toBe(0);
+
+    const [played, unplayed] = quiz.questions as [
+      (typeof quiz.questions)[number],
+      (typeof quiz.questions)[number],
+    ];
+    const flipped = [
+      mcq({
+        id: played.id,
+        choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
+      }),
+      numeric({ id: unplayed.id }),
+    ];
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quiz.id}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: { questions: flipped },
+    });
+    expect(res.statusCode).toBe(423);
+    expect(res.json().error.code).toBe('QUIZ_LOCKED');
+    expect(res.json().error.details).toEqual({ questionId: played.id, reason: 'correct answer changed' });
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/quizzes/${quiz.id}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(detail.json().quiz.isLocked).toBe(true);
+
+    // The question never answered is still editable next to the unchanged played one.
+    const editUnplayed = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quiz.id}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: {
+        questions: [
+          mcq({
+            id: played.id,
+            choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: c.isCorrect })),
+          }),
+          numeric({ id: unplayed.id, prompt: 'Combien, vraiment ?' }),
+        ],
+      },
+    });
+    expect(editUnplayed.statusCode).toBe(200);
+
+    // The duplicate is a fresh, unplayed quiz: the same change goes through there.
+    const dup = await app.inject({
+      method: 'POST',
+      url: `/api/v1/quizzes/${quiz.id}/duplicate`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(dup.statusCode).toBe(201);
+    const copyId = dup.json().quiz.id as string;
+    const copy = await app.inject({
+      method: 'GET',
+      url: `/api/v1/quizzes/${copyId}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(copy.json().quiz.isLocked).toBe(false);
+    const [copyPlayed, copyUnplayed] = copy.json().quiz.questions as Array<{
+      id: string;
+      choices: Array<{ id: string; label: string; isCorrect: boolean }>;
+    }>;
+    const copyFlip = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${copyId}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: {
+        questions: [
+          mcq({
+            id: copyPlayed!.id,
+            choices: copyPlayed!.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
+          }),
+          numeric({ id: copyUnplayed!.id }),
+        ],
+      },
+    });
+    expect(copyFlip.statusCode).toBe(200);
+  });
+
+  it('the lock is re-asserted inside the save transaction (a session created mid-save wins)', async () => {
+    const quiz = await createQuiz('Quiz TOCTOU', [mcq(), numeric()]);
+    const first = quiz.questions[0]!;
+    const keptMcq = {
+      ...mcq({ choices: first.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: c.isCorrect })) }),
+      id: first.id,
+    };
+    // The check has run (no session, nothing answered); a session opens before the transaction.
+    const real = app.prisma;
+    let sessionId = '';
+    const racing = new Proxy(real, {
+      get(target, key) {
+        if (key !== '$transaction') return bound(target, key);
+        return async (arg: unknown) => {
+          const session = await createLiveSession(quiz.id);
+          sessionId = session.sessionId;
+          return (target.$transaction as (a: unknown) => Promise<unknown>).call(target, arg);
+        };
+      },
+    });
+    const decorated = app as unknown as { prisma: typeof real };
+    decorated.prisma = racing;
+    let res;
+    try {
+      res = await app.inject({
+        method: 'PUT',
+        url: `/api/v1/quizzes/${quiz.id}/questions`,
+        cookies: cookiesObject(cookies),
+        payload: { questions: [keptMcq] }, // drops the numeric question
+      });
+    } finally {
+      decorated.prisma = real;
+    }
+    expect(res.statusCode).toBe(423);
+    expect(res.json().error).toMatchObject({
+      code: 'QUIZ_LOCKED',
+      details: { reason: 'lock changed during save' },
+    });
+    // Nothing was written: the numeric question the snapshot names is still there.
+    expect(await app.prisma.question.count({ where: { quizId: quiz.id } })).toBe(2);
+    expect(sessionId).not.toBe('');
+  });
+
   it('answers:progress reaches the final count, latest answers first', async () => {
     const quiz = await createQuiz('Quiz progression', [mcq()]);
     const { code, s } = await createLiveSession(quiz.id);
@@ -1355,6 +1887,248 @@ describe('live engine', () => {
     });
     expect(gone.statusCode).toBe(204);
     expect((await del()).statusCode).toBe(204);
+  });
+
+  const loadedIds = () => (app.sessionManager as unknown as { sessions: Map<string, unknown> }).sessions;
+  const forget = (id: string) =>
+    (app.sessionManager as unknown as { forget: (id: string) => void }).forget(id);
+
+  it('a resume snapshot keeps score and rank off the open question until it closes (no answer oracle)', async () => {
+    const quiz = await createQuiz('Quiz oracle', [mcq(), mcq()]);
+    const { code, s } = await createLiveSession(quiz.id);
+    const lea = await joinAs(code, 'Léa');
+    const tom = await joinAs(code, 'Tom');
+    const choice = (i: number, correct: boolean) =>
+      s.quizSnapshot.questions[i]!.choices.find((c) => c.isCorrect === correct)!.id;
+    await app.sessionManager.startSession(s, false);
+    // Q1: Léa right, Tom wrong → Léa 100, Tom 0.
+    await app.sessionManager.submitAnswer(s, lea.participant, 0, { choiceId: choice(0, true) });
+    await app.sessionManager.submitAnswer(s, tom.participant, 0, { choiceId: choice(0, false) });
+    await app.sessionManager.closeQuestionCommand(s, 0);
+    await app.sessionManager.nextQuestion(s, 0);
+
+    // Q2 open: Tom right, Léa wrong. What each phone reads on resume must not move.
+    await app.sessionManager.submitAnswer(s, tom.participant, 1, { choiceId: choice(1, true) });
+    await app.sessionManager.submitAnswer(s, lea.participant, 1, { choiceId: choice(1, false) });
+    const resumeSnapshot = async (token: string, socketId: string) => {
+      const resumed = await app.sessionManager.resumeByToken(fakeSocket(socketId), token);
+      if (!resumed.ok) throw new Error(resumed.code);
+      return app.sessionManager.participantSnapshot(resumed.s, resumed.participant);
+    };
+    const tomOpen = await resumeSnapshot(tom.token, 'sock-tom-2');
+    const leaOpen = await resumeSnapshot(lea.token, 'sock-lea-2');
+    expect(tomOpen.phase).toBe('QUESTION_OPEN');
+    expect(tomOpen.you).toMatchObject({ score: 0, rank: 2 });
+    expect(leaOpen.you).toMatchObject({ score: 100, rank: 1 });
+    expect(tomOpen.question?.alreadyAnswered).toBe(true);
+    // The presenter keeps the live scores.
+    const live = (await app.sessionManager.presenterSnapshot(s)).participants;
+    expect(live.find((p) => p.id === tom.participant.id)?.score).toBe(100);
+
+    // After question:closed, the new standings show.
+    await app.sessionManager.closeQuestionCommand(s, 1);
+    const tomClosed = await resumeSnapshot(tom.token, 'sock-tom-3');
+    expect(tomClosed.you.score).toBe(100);
+    expect(tomClosed.roundResult).toMatchObject({ totalScore: 100, pointsAwarded: 100 });
+  });
+
+  it('an answer queued behind a close and a reopen is refused, not scored against the new opening', async () => {
+    const quiz = await createQuiz('Quiz file d’attente', [mcq({ timeLimitSec: 30, speedBonusMax: 500 })]);
+    const { code, s } = await createLiveSession(quiz.id);
+    const { participant } = await joinAs(code, 'Rapide');
+    const late = await joinAs(code, 'Tardif');
+    await app.sessionManager.startSession(s, false);
+    const right = s.quizSnapshot.questions[0]!.choices.find((c) => c.isCorrect)!.id;
+
+    // Sent to the first opening, it reaches the lock only after the close and the reopen.
+    const close = app.sessionManager.closeQuestionCommand(s, 0);
+    const reopen = app.sessionManager.reopenQuestion(s, 0);
+    const queued = app.sessionManager.submitAnswer(s, participant, 0, { choiceId: right });
+    expect(await close).toEqual({ ok: true });
+    expect(await reopen).toEqual({ ok: true });
+    expect(await queued).toMatchObject({ ok: false, code: 'QUESTION_CLOSED' });
+    expect(participant.answers.has(0)).toBe(false);
+
+    // Sent while the result was showing, queued behind a reopen: refused as well.
+    await app.sessionManager.closeQuestionCommand(s, 0);
+    const reopened = app.sessionManager.reopenQuestion(s, 0);
+    const early = app.sessionManager.submitAnswer(s, late.participant, 0, { choiceId: right });
+    expect(await reopened).toEqual({ ok: true });
+    expect(await early).toMatchObject({ ok: false, code: 'QUESTION_CLOSED' });
+
+    // An answer sent to the current opening is still accepted.
+    expect(await app.sessionManager.submitAnswer(s, participant, 0, { choiceId: right })).toMatchObject({
+      ok: true,
+    });
+    await app.sessionManager.endSession(s); // stops the auto-close timer
+  });
+
+  it('joining an ENDED session is refused without loading it back into memory', async () => {
+    const quiz = await createQuiz('Quiz terminé', [mcq()]);
+    const { sessionId, code, s } = await createLiveSession(quiz.id);
+    await app.sessionManager.endSession(s);
+    forget(sessionId);
+    const result = await app.sessionManager.join(fakeSocket('sock-late'), code, 'Retard');
+    expect(result).toMatchObject({ ok: false, code: 'SESSION_CLOSED_TO_JOIN' });
+    expect(loadedIds().has(sessionId)).toBe(false);
+  });
+
+  it('a session deleted while not loaded cannot be rebuilt in memory by a concurrent load', async () => {
+    const quiz = await createQuiz('Quiz suppression concurrente', [mcq()]);
+    const { sessionId, s } = await createLiveSession(quiz.id);
+    await app.sessionManager.endSession(s);
+    forget(sessionId);
+    // A delete held open long enough for a load to read the row it is about to remove.
+    let releaseDelete = () => {};
+    const gate = new Promise<void>((resolve) => (releaseDelete = resolve));
+    const liveSession = new Proxy(app.prisma.liveSession, {
+      get(delegate, method) {
+        if (method !== 'delete') return bound(delegate, method);
+        return async (args: Parameters<typeof delegate.delete>[0]) => {
+          await gate;
+          return delegate.delete(args);
+        };
+      },
+    });
+    const manager = new SessionManager(
+      app.io,
+      prismaWith({ liveSession }),
+      () => 'http://localhost',
+      app.log,
+    );
+    const deleted = manager.deleteSession(sessionId);
+    await new Promise((resolve) => setImmediate(resolve)); // the delete now waits on the gate
+    const loaded = await manager.getOrLoad(sessionId);
+    releaseDelete();
+    await deleted;
+    expect(loaded).toBeNull();
+    expect((manager as unknown as { sessions: Map<string, unknown> }).sessions.has(sessionId)).toBe(false);
+  });
+
+  describe('socket handshakes', () => {
+    let base = '';
+    const opened: ClientSocket[] = [];
+
+    beforeAll(async () => {
+      await app.listen({ port: 0, host: '127.0.0.1' });
+      const address = app.server.address();
+      if (!address || typeof address === 'string') throw new Error('no port');
+      base = `http://127.0.0.1:${address.port}`;
+    });
+
+    afterAll(() => {
+      for (const socket of opened) socket.close();
+    });
+
+    /** Resolves 'connected' or the refusal: `data.code` for a middleware one, the message otherwise. */
+    const handshake = (
+      namespace: string,
+      opts: { origin?: string; transport?: 'websocket' | 'polling'; auth?: object; cookie?: string } = {},
+    ) =>
+      new Promise<string>((resolve) => {
+        const headers: Record<string, string> = {};
+        if (opts.origin) headers.origin = opts.origin;
+        if (opts.cookie) headers.cookie = opts.cookie;
+        const socket = ioClient(`${base}${namespace}`, {
+          transports: [opts.transport ?? 'websocket'],
+          extraHeaders: headers,
+          auth: opts.auth ?? {},
+          reconnection: false,
+          forceNew: true,
+        });
+        opened.push(socket);
+        socket.on('connect', () => resolve('connected'));
+        socket.on('connect_error', (err: Error & { data?: { code?: string } }) =>
+          resolve(err.data?.code ?? err.message),
+        );
+      });
+
+    it('refuses a browser handshake from another origin, on both transports', async () => {
+      const quiz = await createQuiz('Quiz origine', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      const presenter = { auth: { sessionId }, cookie: cookies };
+      // PUBLIC_URL defaults to http://localhost:5173 (the Vite dev server, which forwards Origin as is).
+      for (const transport of ['websocket', 'polling'] as const) {
+        expect(await handshake('/participant', { origin: 'http://localhost:5173', transport })).toBe(
+          'connected',
+        );
+        expect(await handshake('/participant', { origin: 'http://127.0.0.1:5173', transport })).toBe(
+          'connected',
+        );
+        expect(await handshake('/participant', { transport })).toBe('connected'); // no Origin: not a browser
+        expect(
+          await handshake('/presenter', { ...presenter, origin: 'http://localhost:5173', transport }),
+        ).toBe('connected');
+        for (const origin of [
+          'http://localhost:8081',
+          'https://localhost:5173',
+          'http://evil.example',
+          'null',
+        ]) {
+          // Refused by the engine before any namespace middleware: no refusal code, a transport error.
+          const participant = await handshake('/participant', { origin, transport });
+          const stage = await handshake('/presenter', { ...presenter, origin, transport });
+          expect([participant, stage]).toEqual([
+            expect.stringMatching(/error/i),
+            expect.stringMatching(/error/i),
+          ]);
+        }
+      }
+    });
+
+    it('refuses a malformed resume token', async () => {
+      expect(await handshake('/participant', { auth: { token: { $ne: '' } } })).toBe('TOKEN_INVALID');
+      expect(await handshake('/participant', { auth: { token: 'x'.repeat(4096) } })).toBe('TOKEN_INVALID');
+    });
+
+    it('checks the presenter owns the session before loading it', async () => {
+      const quiz = await createQuiz('Quiz présentateur', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      forget(sessionId);
+      const other = 'other-presenter@example.fr';
+      await app.prisma.admin.upsert({
+        where: { email: other },
+        update: {},
+        create: { email: other, displayName: 'Autre', passwordHash: await hash(TEST_PASSWORD) },
+      });
+      try {
+        const login = await app.inject({
+          method: 'POST',
+          url: '/api/v1/auth/login',
+          payload: { email: other, password: TEST_PASSWORD },
+        });
+        const otherCookie = setCookieOf(login);
+        expect(await handshake('/presenter', { auth: { sessionId }, cookie: otherCookie })).toBe('FORBIDDEN');
+        expect(loadedIds().has(sessionId)).toBe(false);
+        expect(await handshake('/presenter', { auth: { sessionId: 'nope' }, cookie: cookies })).toBe(
+          'SESSION_NOT_FOUND',
+        );
+        expect(await handshake('/presenter', { auth: { sessionId }, cookie: cookies })).toBe('connected');
+        expect(loadedIds().has(sessionId)).toBe(true);
+      } finally {
+        await app.prisma.admin.delete({ where: { email: other } }).catch(() => undefined);
+      }
+    });
+
+    it('refuses a presenter handshake with a logged-out access token', async () => {
+      const quiz = await createQuiz('Quiz déconnexion', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/login',
+        remoteAddress: '203.0.113.77',
+        payload: { email: TEST_EMAIL, password: TEST_PASSWORD },
+      });
+      const session = setCookieOf(login);
+      expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('connected');
+      const logout = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/logout',
+        cookies: cookiesObject(session),
+      });
+      expect(logout.statusCode).toBe(204);
+      expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('UNAUTHORIZED');
+    });
   });
 });
 
