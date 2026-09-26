@@ -58,6 +58,11 @@ export const ADMIN_PASSWORD_MIN_LENGTH = 12;
 // Upper bound on every password field (login included): Argon2 hashes whatever it is given, so an
 // unbounded body would let one request burn CPU and memory on a multi-megabyte "password".
 export const ADMIN_PASSWORD_MAX_LENGTH = 256;
+// Password-guessing budgets per minute. Login is keyed on the client IP; change-password on the
+// admin of a verified access JWT, so a stolen session cookie cannot brute-force the current password
+// (and turn a temporary theft into a takeover) by rotating IPs.
+export const LOGIN_ATTEMPTS_PER_MINUTE = 10;
+export const CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE = 5;
 
 export const UPLOAD_MAX_IMAGE_MB = 8;
 export const UPLOAD_MAX_AUDIO_MB = 15;

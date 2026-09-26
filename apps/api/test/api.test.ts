@@ -10,6 +10,7 @@ import { createHmac } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
+  CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
   ENDED_PURGE_DELAY_MS,
   IMAGE_MAX_INPUT_PIXELS,
   MAX_JOINS_PER_SECOND_PER_SESSION,
@@ -53,6 +54,8 @@ afterAll(async () => {
 function setCookieOf(res: { cookies: Array<{ name: string; value: string }> }): string {
   return res.cookies.map((c) => `${c.name}=${c.value}`).join('; ');
 }
+
+const b64url = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
 
 describe('health', () => {
   it('GET /healthz → ok', async () => {
@@ -802,7 +805,6 @@ describe('auth hardening', () => {
       payload: { email, password },
     });
   const me = (c: Record<string, string>) => app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: c });
-  const b64url = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
   /** Hand-signed JWT, to try what our own signer never produces. */
   const forge = (header: Record<string, unknown>, claims: Record<string, unknown>, hmac = 'sha256') => {
     const input = `${b64url(header)}.${b64url(claims)}`;
@@ -972,12 +974,12 @@ describe('refresh token credential version', () => {
   const password = 'rotation-pass-12';
   // Own documentation-range addresses: the login route allows 10 per minute and per IP.
   let nextIp = 1;
-  const login = async () => {
+  const login = async (as = email) => {
     const res = await app.inject({
       method: 'POST',
       url: '/api/v1/auth/login',
       remoteAddress: `198.51.100.${nextIp++}`,
-      payload: { email, password },
+      payload: { email: as, password },
     });
     expect(res.statusCode).toBe(200);
     return cookiesObject(setCookieOf(res));
@@ -1085,9 +1087,16 @@ describe('refresh token credential version', () => {
   });
 
   it('a refresh chain racing a password change never survives it', async () => {
-    let victim = await login();
+    // A fresh admin per round: change-password allows CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE per admin,
+    // and twenty changes of one account within a minute would be (rightly) throttled.
+    const passwordHash = await hash(password);
     for (let round = 0; round < 20; round++) {
-      const stolen = await login();
+      const raceEmail = `race-${round}@example.fr`;
+      const { id: raceId } = await app.prisma.admin.create({
+        data: { email: raceEmail, displayName: 'Race', passwordHash },
+      });
+      const victim = await login(raceEmail);
+      const stolen = await login(raceEmail);
       // The thief rotates as fast as it can while the victim changes the password.
       const chain = async () => {
         let current = stolen;
@@ -1099,25 +1108,100 @@ describe('refresh token credential version', () => {
         return current;
       };
       const [last, fresh] = await Promise.all([chain(), changePassword(victim)]);
-      victim = fresh;
       expect((await refresh(last)).statusCode).toBe(401);
       expect((await me(last)).statusCode).toBe(401);
-      const { passwordChangedAt } = await app.prisma.admin.findUniqueOrThrow({ where: { id: adminId } });
+      const { passwordChangedAt } = await app.prisma.admin.findUniqueOrThrow({ where: { id: raceId } });
       // No live row of an older version is left behind at all (the transaction), and the version
       // check in /auth/refresh would refuse one anyway (the test above).
       // NULL-safe: `NOT (col = ?)` alone would skip a NULL-version row.
       const stale = await app.prisma.refreshToken.count({
         where: {
-          adminId,
+          adminId: raceId,
           revokedAt: null,
           OR: [{ credentialVersion: null }, { NOT: { credentialVersion: passwordChangedAt } }],
         },
       });
       expect(stale).toBe(0);
+      expect((await me(fresh)).statusCode).toBe(200);
+      expect((await refresh(fresh)).statusCode).toBe(200);
+      await app.prisma.admin.delete({ where: { id: raceId } });
     }
-    expect((await me(victim)).statusCode).toBe(200);
-    expect((await refresh(victim)).statusCode).toBe(200);
   }, 60_000);
+});
+
+describe('change-password rate limit', () => {
+  // Dedicated admins and documentation-range addresses: the budget is per admin, and neither the
+  // suite's admin nor 127.0.0.1's buckets must move.
+  const password = 'guessed-pass-12';
+  const emails = ['guess-target@example.fr', 'guess-bystander@example.fr'];
+  let nextIp = 100;
+  const login = async (email: string) => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `192.0.2.${nextIp++}`,
+      payload: { email, password },
+    });
+    expect(res.statusCode).toBe(200);
+    return cookiesObject(setCookieOf(res));
+  };
+  const changePassword = (remoteAddress: string, currentPassword: string, c?: Record<string, string>) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/change-password',
+      remoteAddress,
+      ...(c ? { cookies: c } : {}),
+      payload: { currentPassword, newPassword: password },
+    });
+
+  beforeAll(async () => {
+    const passwordHash = await hash(password);
+    for (const email of emails) {
+      await app.prisma.admin.create({ data: { email, displayName: 'Guess', passwordHash } });
+    }
+  });
+
+  afterAll(async () => {
+    await app.prisma.admin.deleteMany({ where: { email: { in: emails } } });
+  });
+
+  it('a stolen session cannot brute-force the current password, from any IP', async () => {
+    const stolen = await login(emails[0]!);
+    for (let i = 0; i < CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE; i++) {
+      const res = await changePassword('192.0.2.200', `wrong-guess-${i}-pad`, stolen);
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe('INVALID_CREDENTIALS');
+    }
+    const blocked = await changePassword('192.0.2.200', 'wrong-guess-last', stolen);
+    expect(blocked.statusCode).toBe(429);
+    // The bucket follows the admin, not the address: rotating IPs buys no extra guess, and the right
+    // password is not even checked any more.
+    expect((await changePassword('192.0.2.201', 'wrong-guess-moved', stolen)).statusCode).toBe(429);
+    expect((await changePassword('192.0.2.202', password, stolen)).statusCode).toBe(429);
+    // A token that does not verify, carrying the target's id, is refused by authenticate before the
+    // limiter: 401, not the exhausted bucket's 429 — an unverified `sub` is never a key.
+    const target = await app.prisma.admin.findUniqueOrThrow({ where: { email: emails[0]! } });
+    const forged = `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url({ sub: target.id })}.bad-signature`;
+    expect((await changePassword('192.0.2.203', password, { access_token: forged })).statusCode).toBe(401);
+    // The account itself is untouched: nothing was changed, the session still works.
+    expect((await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: stolen })).statusCode).toBe(
+      200,
+    );
+  });
+
+  it('another admin, or requests without a valid token, do not use that budget', async () => {
+    const bystander = await login(emails[1]!);
+    // More token-less and forged requests from one address than the budget: none is counted (they
+    // stop at authenticate), so they can neither fill the store nor turn an expired session's 401
+    // (the one the client refreshes on) into a 429.
+    const forged = `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url({ sub: 'nobody' })}.bad-signature`;
+    for (let i = 0; i <= CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE; i++) {
+      expect((await changePassword('192.0.2.204', password)).statusCode).toBe(401);
+      expect((await changePassword('192.0.2.204', password, { access_token: forged })).statusCode).toBe(401);
+    }
+    // Same address, a valid session of another admin: its own, untouched budget.
+    expect((await changePassword('192.0.2.204', password, bystander)).statusCode).toBe(204);
+  });
 });
 
 describe('live engine', () => {

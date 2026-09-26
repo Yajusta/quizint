@@ -54,11 +54,21 @@ async function rawRequest(path: string, init: RequestInit, retry = true): Promis
       ...init.headers,
     },
   });
-  if (res.status === 401 && retry && !path.startsWith('/auth/refresh') && !path.startsWith('/auth/login')) {
-    await refreshSession();
-    return rawRequest(path, init, false);
+  if (res.status !== 401 || !retry || path.startsWith('/auth/refresh') || path.startsWith('/auth/login')) {
+    return res;
   }
-  return res;
+  // A wrong password (change-password's current one) is a 401 too, but no refresh fixes it: a
+  // retry would only resend the same guess and spend a second slot of the route's rate limit.
+  const code = await res
+    .clone()
+    .json()
+    .then(
+      (body: ApiError | null) => body?.error?.code,
+      () => undefined,
+    );
+  if (code === 'INVALID_CREDENTIALS') return res;
+  await refreshSession();
+  return rawRequest(path, init, false);
 }
 
 /**

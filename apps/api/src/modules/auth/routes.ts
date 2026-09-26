@@ -1,8 +1,15 @@
 // Auth routes (§5.1): login, refresh, logout, me, admin management, change-password.
 
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 
-import { AdminCreateInput, AdminPatchInput, ChangePasswordInput, LoginInput } from '@quiz/shared';
+import {
+  AdminCreateInput,
+  AdminPatchInput,
+  CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
+  ChangePasswordInput,
+  LOGIN_ATTEMPTS_PER_MINUTE,
+  LoginInput,
+} from '@quiz/shared';
 
 import {
   ACCESS_TOKEN_COOKIE,
@@ -38,7 +45,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // --- POST /api/v1/auth/login ---------------------------------------------
   app.post(
     '/auth/login',
-    { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } },
+    { config: { rateLimit: { max: LOGIN_ATTEMPTS_PER_MINUTE, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const parsed = LoginInput.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send(apiError('INVALID_CREDENTIALS'));
@@ -157,26 +164,45 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   );
 
   // --- POST /api/v1/auth/change-password ------------------------------------
-  app.post('/auth/change-password', { preHandler: app.authenticate }, async (req, reply) => {
-    const parsed = ChangePasswordInput.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.status(400).send(validationError(parsed.error));
-    }
-    const admin = await app.prisma.admin.findUnique({ where: { id: req.adminId! } });
-    if (!admin) return reply.status(404).send(apiError('NOT_FOUND'));
-    const ok = await verifyPassword(admin.passwordHash, parsed.data.currentPassword);
-    if (!ok) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
-    // passwordChangedAt is the credential version every access JWT carries: bumping it refuses all
-    // the JWTs signed before, this request's own included.
-    const updated = await app.prisma.admin.update({
-      where: { id: admin.id },
-      data: { passwordHash: await hashPassword(parsed.data.newPassword), passwordChangedAt: new Date() },
-    });
-    // Every other session of this account ends (a stolen refresh cookie or access JWT included);
-    // this browser gets fresh cookies so the admin who just changed their password stays signed in.
-    await app.revokeAdminSessions(admin.id);
-    app.issueAccessToken(reply, updated);
-    await app.issueRefreshToken(reply, admin.id, updated.passwordChangedAt);
-    return reply.status(204).send();
-  });
+  // The limit runs as a preHandler, after authenticate (appended to the route's preHandler array),
+  // not on onRequest: the key is the admin that authenticate verified in full, never an unverified
+  // claim. Keyed on the admin, a stolen cookie gets the same budget from any IP. A request without a
+  // valid token stops at authenticate's 401 and never touches the store: it cannot evict an admin's
+  // bucket from the LRU, and an expired token still gets the 401 the client refreshes on, not a 429.
+  app.post(
+    '/auth/change-password',
+    {
+      preHandler: app.authenticate,
+      config: {
+        rateLimit: {
+          hook: 'preHandler',
+          max: CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
+          timeWindow: '1 minute',
+          keyGenerator: (req: FastifyRequest) => `admin:${req.adminId}`,
+        },
+      },
+    },
+    async (req, reply) => {
+      const parsed = ChangePasswordInput.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send(validationError(parsed.error));
+      }
+      const admin = await app.prisma.admin.findUnique({ where: { id: req.adminId! } });
+      if (!admin) return reply.status(404).send(apiError('NOT_FOUND'));
+      const ok = await verifyPassword(admin.passwordHash, parsed.data.currentPassword);
+      if (!ok) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
+      // passwordChangedAt is the credential version every access JWT carries: bumping it refuses all
+      // the JWTs signed before, this request's own included.
+      const updated = await app.prisma.admin.update({
+        where: { id: admin.id },
+        data: { passwordHash: await hashPassword(parsed.data.newPassword), passwordChangedAt: new Date() },
+      });
+      // Every other session of this account ends (a stolen refresh cookie or access JWT included);
+      // this browser gets fresh cookies so the admin who just changed their password stays signed in.
+      await app.revokeAdminSessions(admin.id);
+      app.issueAccessToken(reply, updated);
+      await app.issueRefreshToken(reply, admin.id, updated.passwordChangedAt);
+      return reply.status(204).send();
+    },
+  );
 }
