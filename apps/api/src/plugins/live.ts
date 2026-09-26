@@ -215,27 +215,21 @@ export const livePlugin = fp(
       // The access cookie lives as long as the JWT, so an expired session usually shows up as a
       // missing cookie rather than a bad token: the client refreshes on both codes.
       if (!token) return next(socketError('UNAUTHORIZED', 'Non authentifié'));
-      let payload: { sub: string; email: string };
-      try {
-        // Same verifier as the REST guard (app.jwt): pinning set in the JWT plugin's registered
-        // `verify` options (algorithms / iss / aud) applies here too. TODO: if that pinning is passed
-        // per call in plugins/auth.ts instead, pass the same options here.
-        payload = app.jwt.verify<{ sub: string; email: string }>(token.slice(cookiePrefix.length));
-      } catch {
-        return next(socketError('TOKEN_EXPIRED', 'Session expirée, reconnexion…'));
-      }
       const attach = PresenterAttachAuth.safeParse(socket.handshake.auth ?? {});
       if (!attach.success) return next(socketError('SESSION_NOT_FOUND', 'Session inconnue'));
       const { sessionId } = attach.data;
       try {
-        // Like the REST guard: a deactivated admin must not drive a stage until the JWT expires.
-        // TODO(credential version): once Admin.passwordChangedAt exists, select it here and refuse a
-        // token whose `iat` predates it, exactly as `authenticate` does in plugins/auth.ts.
-        const admin = await app.prisma.admin.findUnique({
-          where: { id: payload.sub },
-          select: { isActive: true },
-        });
-        if (!admin?.isActive) return next(socketError('UNAUTHORIZED', 'Non authentifié'));
+        // Same check as the REST guard: signature/alg/iss/aud/exp, logout, inactive account and
+        // credential version (a password change refuses every earlier token).
+        const check = await app.verifyAccessToken(token.slice(cookiePrefix.length));
+        if (!check.ok) {
+          return next(
+            check.reason === 'invalid'
+              ? socketError('TOKEN_EXPIRED', 'Session expirée, reconnexion…')
+              : socketError('UNAUTHORIZED', 'Non authentifié'),
+          );
+        }
+        const payload = { sub: check.adminId };
         (socket.data as { adminId: string }).adminId = payload.sub;
         // Ownership from the row first: a non-owner must not be able to pull a session into memory.
         const row = await app.prisma.liveSession.findUnique({

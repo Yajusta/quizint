@@ -2108,6 +2108,26 @@ describe('live engine', () => {
         await app.prisma.admin.delete({ where: { email: other } }).catch(() => undefined);
       }
     });
+
+    it('refuses a presenter handshake with a logged-out access token', async () => {
+      const quiz = await createQuiz('Quiz déconnexion', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/login',
+        remoteAddress: '203.0.113.77',
+        payload: { email: TEST_EMAIL, password: TEST_PASSWORD },
+      });
+      const session = setCookieOf(login);
+      expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('connected');
+      const logout = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/logout',
+        cookies: cookiesObject(session),
+      });
+      expect(logout.statusCode).toBe(204);
+      expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('UNAUTHORIZED');
+    });
   });
 });
 
