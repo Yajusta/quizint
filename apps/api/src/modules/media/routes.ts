@@ -4,16 +4,25 @@
 import { randomUUID } from 'node:crypto';
 import { unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { finished } from 'node:stream/promises';
 
 import multipart from '@fastify/multipart';
 import staticFiles from '@fastify/static';
 import { fileTypeFromBuffer as fromBuffer } from 'file-type';
 import type { FastifyInstance } from 'fastify';
-import type { Multipart } from '@fastify/multipart';
 import sharp from 'sharp';
 import { parseBuffer as parseMusicMetadata } from 'music-metadata';
 
-import { UPLOAD_MAX_AUDIO_MB, UPLOAD_MAX_IMAGE_MB, IMAGE_MAX_WIDTH } from '@quiz/shared';
+import {
+  IMAGE_MAX_INPUT_PIXELS,
+  IMAGE_MAX_WIDTH,
+  UPLOAD_MAX_AUDIO_MB,
+  UPLOAD_MAX_IMAGE_MB,
+  UPLOAD_MULTIPART_MAX_FIELD_SIZE,
+  UPLOAD_MULTIPART_MAX_FIELDS,
+  UPLOAD_MULTIPART_MAX_FILES,
+  UPLOAD_MULTIPART_MAX_PARTS,
+} from '@quiz/shared';
 
 import { apiError } from '../../lib/api.js';
 
@@ -23,27 +32,42 @@ const IMAGE_MIMES = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif
 const AUDIO_EXTS = new Set(['mp3', 'm4a', 'aac', 'ogg', 'oga', 'opus', 'wav', 'flac']);
 
 export async function mediaRoutes(app: FastifyInstance): Promise<void> {
-  await app.register(multipart, { limits: { fileSize: UPLOAD_MAX_AUDIO_MB * 1024 * 1024 } });
-
-  app.addHook('onRequest', async (req, reply) => {
-    // Uploads are admin-only; static /uploads stays public (registered separately).
-    if (req.url.startsWith('/api/v1/media')) {
-      await app.authenticate(req, reply);
-    }
+  // Busboy bounds: one file (a second one is a 413, not silently dropped), a handful of parts and
+  // small field values, so a crafted body cannot make the parser hold thousands of parts.
+  await app.register(multipart, {
+    limits: {
+      fileSize: UPLOAD_MAX_AUDIO_MB * 1024 * 1024,
+      files: UPLOAD_MULTIPART_MAX_FILES,
+      fields: UPLOAD_MULTIPART_MAX_FIELDS,
+      parts: UPLOAD_MULTIPART_MAX_PARTS,
+      fieldSize: UPLOAD_MULTIPART_MAX_FIELD_SIZE,
+    },
   });
+
+  // Every route of this encapsulated plugin is admin-only, so the guard applies unconditionally:
+  // testing `req.url` here once let `/api/v1/%6Dedia` (raw URL, decoded only by the router) through.
+  // Static /uploads stays public: it is registered as a sibling plugin, outside this scope.
+  app.addHook('onRequest', app.authenticate);
 
   // --- POST /api/v1/media -------------------------------------------------------
   app.post('/media', { config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, async (req, reply) => {
-    let file: Multipart | null = null;
+    const ownerId = req.adminId;
+    if (ownerId == null) return reply.status(401).send(apiError('UNAUTHORIZED'));
+    let buffer: Buffer | null = null;
+    let filename = 'upload';
+    // Consume the whole body: busboy only yields the next part once the current file stream has
+    // ended, so a file part left unread would stall the request. Field values arrive buffered
+    // (bounded by fieldSize) and are ignored; any file other than the first "file" is drained.
     for await (const part of req.parts()) {
-      if (part.type === 'file' && part.fieldname === 'file') {
-        file = part;
-        break;
+      if (part.type !== 'file') continue;
+      if (part.fieldname === 'file' && buffer === null) {
+        buffer = await part.toBuffer();
+        filename = part.filename || 'upload';
+      } else {
+        await finished(part.file.resume());
       }
     }
-    if (!file) return reply.status(400).send(apiError('VALIDATION', 'multipart field "file" required'));
-    const buffer = await file.toBuffer();
-    const filename = file.filename || 'upload';
+    if (!buffer) return reply.status(400).send(apiError('VALIDATION', 'multipart field "file" required'));
 
     // Magic-byte detection — never trust the declared content type.
     const detected = await fromBuffer(buffer);
@@ -70,7 +94,12 @@ export async function mediaRoutes(app: FastifyInstance): Promise<void> {
       // is ever written to the public /uploads route as is.
       // Valid magic bytes over a truncated or garbage body: sharp rejects, that is a 415, not a 500.
       try {
-        const img = sharp(buffer, { failOn: 'none', animated: mime === 'image/gif' });
+        // limitInputPixels is read from the header, before any pixel is decoded (decompression bomb).
+        const img = sharp(buffer, {
+          failOn: 'none',
+          animated: mime === 'image/gif',
+          limitInputPixels: IMAGE_MAX_INPUT_PIXELS,
+        });
         finalBuffer = Buffer.from(
           await img
             .resize({ width: IMAGE_MAX_WIDTH, withoutEnlargement: true })
@@ -96,7 +125,7 @@ export async function mediaRoutes(app: FastifyInstance): Promise<void> {
     const row = await app.prisma.media
       .create({
         data: {
-          ownerId: req.adminId!,
+          ownerId,
           kind: isImage ? 'IMAGE' : 'AUDIO',
           mimeType: isImage ? 'image/webp' : mime,
           originalName: filename,
@@ -131,7 +160,9 @@ export async function mediaRoutes(app: FastifyInstance): Promise<void> {
 
   // --- DELETE /api/v1/media/:id ---------------------------------------------------
   app.delete<{ Params: { id: string } }>('/media/:id', async (req, reply) => {
-    const media = await app.prisma.media.findFirst({ where: { id: req.params.id, ownerId: req.adminId! } });
+    const ownerId = req.adminId;
+    if (ownerId == null) return reply.status(401).send(apiError('UNAUTHORIZED'));
+    const media = await app.prisma.media.findFirst({ where: { id: req.params.id, ownerId } });
     if (!media) return reply.status(404).send(apiError('NOT_FOUND'));
     const referenced =
       (await app.prisma.question.count({ where: { mediaId: media.id } })) > 0 ||
@@ -158,8 +189,6 @@ async function snapshotReferences(app: FastifyInstance, storageKey: string): Pro
     LIMIT 1`;
   return rows.length > 0;
 }
-
-// Static /uploads — public, immutable cache (content-addressed by uuid).
 
 // Static /uploads — public, immutable cache (content-addressed by uuid).
 export async function uploadsStaticPlugin(app: FastifyInstance): Promise<void> {

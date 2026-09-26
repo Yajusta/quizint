@@ -1,7 +1,7 @@
 // Quiz routes (§5.2): CRUD, transactional question replacement with id preservation,
 // locking rules, duplication, JSON import/export.
 
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import type { FastifyInstance } from 'fastify';
 
 import {
@@ -23,15 +23,27 @@ function numericAnswerKey(raw: unknown): string | null {
   return n ? `${n.value}|${n.tolerance ?? 0}|${n.toleranceMode ?? 'ABSOLUTE'}` : null;
 }
 
+/**
+ * `Quiz.playedQuestionIds`: questions answered in a session since deleted. Written by the session
+ * DELETE route before the answers cascade away, so the lock outlives them.
+ */
+export function storedPlayedQuestionIds(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((id): id is string => typeof id === 'string') : [];
+}
+
 export async function quizRoutes(app: FastifyInstance): Promise<void> {
   /** A session that is not over still runs on the quiz's frozen snapshot. */
   const hasLiveSession = async (quizId: string): Promise<boolean> =>
     (await app.prisma.liveSession.count({ where: { quizId, phase: { not: 'ENDED' } } })) > 0;
 
-  /** Locked = a question has answers, or a session that is not over still runs on the quiz. */
-  const isQuizLocked = async (quizId: string): Promise<boolean> =>
-    (await app.prisma.question.count({ where: { quizId, answers: { some: {} } } })) > 0 ||
-    (await hasLiveSession(quizId));
+  /**
+   * Locked = a question has answers, or had some in a session since deleted, or a session that is
+   * not over still runs on the quiz.
+   */
+  const isQuizLocked = async (quiz: { id: string; playedQuestionIds: unknown }): Promise<boolean> =>
+    storedPlayedQuestionIds(quiz.playedQuestionIds).length > 0 ||
+    (await app.prisma.question.count({ where: { quizId: quiz.id, answers: { some: {} } } })) > 0 ||
+    (await hasLiveSession(quiz.id));
 
   function getOwnedQuiz(quizId: string, adminId: string) {
     return app.prisma.quiz.findFirst({
@@ -157,9 +169,10 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const quiz = await getOwnedQuiz(req.params.id, req.adminId!);
       if (!quiz) return reply.status(404).send(apiError('NOT_FOUND'));
-      // Same rule as the PUT lock: a quiz is locked once one of its questions has an answer, or
-      // while a session that is not over still runs on its frozen snapshot.
-      const isLocked = await isQuizLocked(quiz.id);
+      // Same rule as the PUT lock: a quiz is locked once one of its questions has been answered
+      // (even in a session deleted since), or while a session that is not over still runs on its
+      // frozen snapshot.
+      const isLocked = await isQuizLocked(quiz);
       return {
         quiz: {
           id: quiz.id,
@@ -356,15 +369,20 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
       // A session that is not over runs on a snapshot that names every question by id and
       // `Answer.questionId` restricts deletion: a question dropped before it is reached would fail
       // every answer of that round. While such a session exists, every existing question is locked.
+      // Otherwise a question is played once answered, including in a session deleted since.
+      const liveAtCheck = await hasLiveSession(quiz.id);
       const playedQuestionIds = new Set(
-        (await hasLiveSession(quiz.id))
+        liveAtCheck
           ? quiz.questions.map((q) => q.id)
-          : (
-              await app.prisma.question.findMany({
-                where: { quizId: quiz.id, answers: { some: {} } },
-                select: { id: true },
-              })
-            ).map((q) => q.id),
+          : [
+              ...storedPlayedQuestionIds(quiz.playedQuestionIds),
+              ...(
+                await app.prisma.question.findMany({
+                  where: { quizId: quiz.id, answers: { some: {} } },
+                  select: { id: true },
+                })
+              ).map((q) => q.id),
+            ],
       );
 
       // Locking rules (§3.2): played questions cannot be deleted, reordered, retyped, re-choice'd,
@@ -421,6 +439,25 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
       // hit Prisma's 5 s limit on a 200-question quiz, blocking every live write meanwhile.
       const { prisma } = app;
       const ops: Prisma.PrismaPromise<unknown>[] = [];
+      // The lock was read before the transaction: a session created (or answered, or deleted with
+      // its answers) in between would let a now-played question through. The first statement
+      // re-asserts, inside the transaction, every fact the check relied on; it matches no row when
+      // one changed, and the P2025 it raises rolls the whole batch back.
+      const unlockedIds = quiz.questions.map((q) => q.id).filter((id) => !playedQuestionIds.has(id));
+      ops.push(
+        prisma.quiz.update({
+          where: {
+            id: quiz.id,
+            playedQuestionIds: { equals: (quiz.playedQuestionIds as Prisma.InputJsonValue) ?? Prisma.DbNull },
+            ...(liveAtCheck ? {} : { sessions: { none: { phase: { not: 'ENDED' } } } }),
+            ...(unlockedIds.length > 0
+              ? { questions: { none: { id: { in: unlockedIds }, answers: { some: {} } } } }
+              : {}),
+          },
+          data: {},
+          select: { id: true },
+        }),
+      );
       for (const existing of quiz.questions) {
         if (!incomingIndexById.has(existing.id) && !playedQuestionIds.has(existing.id)) {
           ops.push(prisma.question.delete({ where: { id: existing.id } }));
@@ -483,7 +520,18 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
           );
         }
       }
-      await prisma.$transaction(ops);
+      try {
+        await prisma.$transaction(ops);
+      } catch (err) {
+        if (
+          err instanceof Prisma.PrismaClientKnownRequestError &&
+          err.code === 'P2025' &&
+          err.meta?.modelName === 'Quiz'
+        ) {
+          return reply.status(423).send(apiError('QUIZ_LOCKED', { reason: 'lock changed during save' }));
+        }
+        throw err;
+      }
 
       const updated = await getOwnedQuiz(quiz.id, req.adminId!);
       return { quiz: { ...updated, questions: updated?.questions.map(toQuestionDTO) ?? [] } };
