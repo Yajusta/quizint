@@ -33,6 +33,7 @@ import {
   buildFinalStats,
   buildQuestionDistribution,
   buildRanking,
+  buildVisibleRanking,
   canTransition,
   correctAnswerFor,
   GRACE_MS,
@@ -205,6 +206,10 @@ function socketsByParticipant(): Map<string, Socket[]> {
 function buildParticipantSnapshot(s: MockSession, p: MockParticipant) {
   const q = currentQuestion(s);
   const ranking = rankingOf(s);
+  // Like the API: while a question is open, its points stay out of the participant's score and rank.
+  const openIndex = s.phase === 'QUESTION_OPEN' ? s.currentQuestionIndex : null;
+  const visible = buildVisibleRanking(statsParticipants(s), statsAnswers(s), openIndex);
+  const you = visible.find((r) => r.participantId === p.id);
   const view: ParticipantQuestionView | null = q ? toParticipantQuestionView(q) : null;
   const answer = q ? p.answers.get(s.currentQuestionIndex) : undefined;
   return {
@@ -214,7 +219,12 @@ function buildParticipantSnapshot(s: MockSession, p: MockParticipant) {
     phase: s.phase,
     questionIndex: s.currentQuestionIndex,
     totalQuestions: s.quizSnapshot.questions.length,
-    you: { participantId: p.id, nickname: p.nickname, score: p.score, rank: participantRank(ranking, p.id) },
+    you: {
+      participantId: p.id,
+      nickname: p.nickname,
+      score: you?.score ?? 0,
+      rank: participantRank(visible, p.id),
+    },
     participantCount: ranking.length,
     question:
       view && s.phase === 'QUESTION_OPEN'

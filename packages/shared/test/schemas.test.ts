@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
 import { LiveSessionSettings, LiveSessionSettingsPatch, QuizExportV1 } from '../src/schemas/domain.js';
-import { SettingsUpdateCommand } from '../src/schemas/events.js';
+import { ParticipantResumeAuth, PresenterAttachAuth, SettingsUpdateCommand } from '../src/schemas/events.js';
 import { QuizCreateInput, QuizPatchInput } from '../src/schemas/rest.js';
 
 describe('settings patches', () => {
@@ -56,5 +56,23 @@ describe('QuizExportV1', () => {
     // Regression: an import above the cap created a quiz the editor could never save again.
     expect(QuizExportV1.safeParse(file(QUESTIONS_PER_QUIZ_MAX)).success).toBe(true);
     expect(QuizExportV1.safeParse(file(QUESTIONS_PER_QUIZ_MAX + 1)).success).toBe(false);
+  });
+});
+
+describe('handshake auth', () => {
+  it('ParticipantResumeAuth takes a base64url token as issued and nothing else', () => {
+    expect(ParticipantResumeAuth.safeParse({ token: 'A'.repeat(43) }).success).toBe(true);
+    expect(ParticipantResumeAuth.safeParse({ token: 'abc_-DEF0123456789xyz' }).success).toBe(true);
+    for (const token of ['short', 'A'.repeat(129), 'a b'.repeat(10), 42, { $ne: '' }]) {
+      expect(ParticipantResumeAuth.safeParse({ token }).success).toBe(false);
+    }
+  });
+
+  it('PresenterAttachAuth takes a session UUID', () => {
+    const id = '3f73c70e-6dea-440a-a479-3a8da9f9f909';
+    expect(PresenterAttachAuth.safeParse({ sessionId: id }).success).toBe(true);
+    for (const sessionId of [undefined, '', 'not-a-uuid', 7, [id]]) {
+      expect(PresenterAttachAuth.safeParse({ sessionId }).success).toBe(false);
+    }
   });
 });

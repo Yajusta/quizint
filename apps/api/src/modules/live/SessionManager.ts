@@ -15,6 +15,7 @@ import {
   buildFinalStats,
   buildQuestionDistribution,
   buildRanking,
+  buildVisibleRanking,
   canTransition,
   correctAnswerFor,
   errorMessage,
@@ -128,6 +129,10 @@ export class SessionManager {
    */
   private readonly roundCache = new Map<string, ReturnType<SessionManager['roundResult']>>();
   private readonly rankingCache = new Map<string, RankingRow[]>();
+  /** The participants' view of the ranking while a question is open (see `visibleRanking`). */
+  private readonly visibleRankingCache = new Map<string, RankingRow[]>();
+  /** Sessions being deleted: `getOrLoad` must not rebuild one from a row about to disappear. */
+  private readonly deleting = new Set<string>();
 
   constructor(
     private readonly io: SocketIOServer,
@@ -139,6 +144,7 @@ export class SessionManager {
   // --- Loading -----------------------------------------------------------------
 
   async getOrLoad(sessionId: string): Promise<LiveSessionState | null> {
+    if (this.deleting.has(sessionId)) return null;
     const cached = this.sessions.get(sessionId);
     if (cached) return cached;
     const inflight = this.loading.get(sessionId);
@@ -258,6 +264,25 @@ export class SessionManager {
     return ranking;
   }
 
+  /**
+   * The ranking a participant may see: while a question is open, without its points and answer
+   * times (shared `buildVisibleRanking`), so a resume snapshot is no oracle of an answer's
+   * correctness before `question:closed`. Otherwise the live ranking. The presenter keeps the live one.
+   */
+  private visibleRanking(s: LiveSessionState): RankingRow[] {
+    if (s.phase !== 'QUESTION_OPEN') return this.cachedRanking(s);
+    let ranking = this.visibleRankingCache.get(s.sessionId);
+    if (!ranking) {
+      ranking = buildVisibleRanking(
+        this.aliveParticipants(s).map(toStatsParticipant),
+        [...pAnswers(s)],
+        s.currentQuestionIndex,
+      );
+      this.visibleRankingCache.set(s.sessionId, ranking);
+    }
+    return ranking;
+  }
+
   private cachedRoundResult(s: LiveSessionState): ReturnType<SessionManager['roundResult']> {
     let result = this.roundCache.get(s.sessionId);
     if (!result) {
@@ -271,6 +296,7 @@ export class SessionManager {
   private invalidateDerived(s: LiveSessionState): void {
     this.roundCache.delete(s.sessionId);
     this.rankingCache.delete(s.sessionId);
+    this.visibleRankingCache.delete(s.sessionId);
     s.finalCache = null;
   }
 
@@ -283,9 +309,12 @@ export class SessionManager {
   ): Promise<{ ok: true; participant: ParticipantState; s: LiveSessionState; token: string } | Refusal> {
     const session = await this.prisma.liveSession.findUnique({
       where: { code: code.toUpperCase() },
-      select: { id: true },
+      select: { id: true, phase: true },
     });
     if (!session) return refuse('SESSION_NOT_FOUND');
+    // Checked on the row first: an ENDED session is not rebuilt in memory just to be refused.
+    // The check under the lock below still decides for a session that is loaded.
+    if (!isJoinable(asPhase(session.phase))) return refuse('SESSION_CLOSED_TO_JOIN');
     const s = await this.getOrLoad(session.id);
     if (!s) return refuse('SESSION_NOT_FOUND');
 
@@ -337,6 +366,9 @@ export class SessionManager {
       participant.id = row.id;
       s.participants.set(participant.id, participant);
       s.byNickname.set(participant.nicknameKey, participant.id);
+      // A new row in the ranking the snapshots rank against (the stored round result keeps its own).
+      this.rankingCache.delete(s.sessionId);
+      this.visibleRankingCache.delete(s.sessionId);
 
       socket.join(participantsRoom(s.sessionId));
       socket.data.sessionId = s.sessionId;
@@ -410,9 +442,15 @@ export class SessionManager {
     // Arrival time, taken before waiting for the lock: the grace window and the speed bonus
     // must not depend on how many answers are queued ahead of this one.
     const receivedAt = now();
+    // The opening this answer was sent to, also read before the lock: queued behind a close +
+    // reopen (or a next), it must not be scored against a later opening, where `elapsedMs` would
+    // clamp to 0 and earn the full speed bonus.
+    const opening = { open: s.phase === 'QUESTION_OPEN', openedAt: s.questionOpenedAt };
     // Under the lock: a close cannot slip between the phase check and the durable write,
     // so every accepted answer is part of the round result it belongs to.
-    return s.mutex.runExclusive(() => this.recordAnswer(s, participant, questionIndex, answer, receivedAt));
+    return s.mutex.runExclusive(() =>
+      this.recordAnswer(s, participant, questionIndex, answer, receivedAt, opening),
+    );
   }
 
   private async recordAnswer(
@@ -421,10 +459,13 @@ export class SessionManager {
     questionIndex: number,
     answer: { choiceId?: string; value?: string; text?: string },
     receivedAt: number,
+    opening: { open: boolean; openedAt: number | null },
   ): Promise<{ ok: true; answeredAt: number } | Refusal> {
     if (participant.isKicked) return refuse('KICKED');
     if (s.phase !== 'QUESTION_OPEN') return refuse('QUESTION_CLOSED');
     if (questionIndex !== s.currentQuestionIndex) return refuse('WRONG_QUESTION');
+    // Sent while nothing was open, or to an opening that has since been closed and replaced.
+    if (!opening.open || opening.openedAt !== s.questionOpenedAt) return refuse('QUESTION_CLOSED');
     if (participant.answers.has(questionIndex)) return refuse('ALREADY_ANSWERED');
 
     const q = this.questionAt(s);
@@ -610,19 +651,27 @@ export class SessionManager {
 
   /**
    * Deletes a session and all its data (RGPD). A loaded session is stopped under its lock first,
-   * so no timer or in-flight command writes against the deleted row afterwards.
+   * so no timer or in-flight command writes against the deleted row afterwards. While the delete
+   * runs, `getOrLoad` answers null: a session that is not loaded cannot be rebuilt from the row
+   * being deleted and left behind in memory as a ghost with its timers.
    */
   async deleteSession(sessionId: string): Promise<void> {
-    const s = this.sessions.get(sessionId) ?? (await this.loading.get(sessionId)) ?? null;
-    if (!s) {
-      await this.prisma.liveSession.delete({ where: { id: sessionId } });
-      return;
+    this.deleting.add(sessionId);
+    try {
+      // A load that started before the flag is awaited: it is then stopped under its lock.
+      const s = this.sessions.get(sessionId) ?? (await this.loading.get(sessionId)) ?? null;
+      if (!s) {
+        await this.prisma.liveSession.delete({ where: { id: sessionId } });
+        return;
+      }
+      await s.mutex.runExclusive(async () => {
+        await this.prisma.liveSession.delete({ where: { id: sessionId } });
+        if (s.phase !== 'ENDED') this.shutdown(s);
+        this.forget(sessionId);
+      });
+    } finally {
+      this.deleting.delete(sessionId);
     }
-    await s.mutex.runExclusive(async () => {
-      await this.prisma.liveSession.delete({ where: { id: sessionId } });
-      if (s.phase !== 'ENDED') this.shutdown(s);
-      this.forget(sessionId);
-    });
   }
 
   async kick(s: LiveSessionState, participantId: string): Promise<CommandResult> {
@@ -679,6 +728,7 @@ export class SessionManager {
     this.sessions.delete(sessionId);
     this.roundCache.delete(sessionId);
     this.rankingCache.delete(sessionId);
+    this.visibleRankingCache.delete(sessionId);
     const progress = this.progress.get(sessionId);
     if (progress?.trailing) clearTimeout(progress.trailing);
     this.progress.delete(sessionId);
@@ -1128,9 +1178,12 @@ export class SessionManager {
 
   async participantSnapshot(s: LiveSessionState, p: ParticipantState) {
     const q = this.questionAt(s);
-    const ranking = this.cachedRanking(s);
-    const rank = ranking.find((r) => r.participantId === p.id)?.rank ?? ranking.length;
+    // Answer secrecy: during QUESTION_OPEN, score and rank leave the open question's points out.
+    const ranking = this.visibleRanking(s);
+    const row = ranking.find((r) => r.participantId === p.id);
+    const rank = row?.rank ?? ranking.length;
     const answer = q ? p.answers.get(s.currentQuestionIndex) : undefined;
+    const pending = s.phase === 'QUESTION_OPEN' ? (answer?.pointsAwarded ?? 0) : 0;
     return {
       sessionId: s.sessionId,
       code: s.code,
@@ -1138,7 +1191,7 @@ export class SessionManager {
       phase: s.phase,
       questionIndex: s.currentQuestionIndex,
       totalQuestions: s.quizSnapshot.questions.length,
-      you: { participantId: p.id, nickname: p.nickname, score: p.score, rank },
+      you: { participantId: p.id, nickname: p.nickname, score: row?.score ?? p.score - pending, rank },
       participantCount: ranking.length,
       question:
         q && s.phase === 'QUESTION_OPEN'
