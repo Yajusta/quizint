@@ -28,6 +28,7 @@ Read [CLAUDE.md](CLAUDE.md) before anything else: it states the architecture, th
 - `docs/PROTOCOL.md` is generated from the Zod schemas — never hand-edit it, run `pnpm docs:protocol`.
 - User-facing strings live in `apps/web/src/i18n/locales/<lng>/`, never inline. Every French key needs its English counterpart.
 - The vendored design system under `apps/web/src/design-system/` must not be reformatted; log every deliberate deviation in its own `README.md`.
+- Security rules: build web API paths with the `apiPath` tagged template (`apps/web/src/lib/api-client.ts`), never by concatenation; check access tokens only through `app.verifyAccessToken`; route every participant payload through `toParticipantQuestionView()`; put new limits in `packages/shared/src/constants.ts`. If you raise `UPLOAD_MAX_AUDIO_MB`, raise the `/api` `request_body` cap in `deploy/Caddyfile` too.
 
 ## Before opening a pull request
 

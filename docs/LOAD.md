@@ -22,6 +22,19 @@ Le script (`test/load-smoke.mjs`) :
 > `question:close`, donc après que le serveur a déjà diffusé l'événement. La métrique vaut
 > 0 par construction et ne mesure rien. À corriger si l'on veut réellement l'observer.
 
+### Limites par IP et contrôles d'origine
+
+Le script ouvre tous ses sockets depuis une seule adresse (le loopback). Le plafond de sockets
+`/participant` simultanés par IP, `MAX_PARTICIPANT_SOCKETS_PER_IP` (600, soit
+`MAX_PARTICIPANTS_PER_SESSION` + 100), reste au-dessus des 500 clients du profil le plus
+agressif. Les autres limites par IP de `plugins/live.ts` s'appliquent aussi à ce trafic :
+120 handshakes et 60 `participant:join` par fenêtre de 10 s ; au-delà, le serveur répond
+`RATE_LIMITED`.
+
+Le script (Node, `socket.io-client`) n'envoie pas d'en-tête `Origin` : ni le garde CSRF des
+requêtes REST ni le contrôle d'origine des handshakes socket.io ne le bloquent. Aucun
+réglage de `PUBLIC_URL` n'est donc nécessaire pour la mesure.
+
 ## Résultats — SQLite (win32-x64, Node 25, machine de dev)
 
 | Métrique                     | 200 clients              | 500 clients               |

@@ -28,6 +28,7 @@ Lisez [CLAUDE.md](CLAUDE.md) avant toute chose : l'architecture, les invariants 
 - `docs/PROTOCOL.md` est généré depuis les schémas Zod — ne l'éditez jamais à la main, lancez `pnpm docs:protocol`.
 - Les textes affichés vivent dans `apps/web/src/i18n/locales/<lng>/`, jamais en dur. Chaque clé française a sa contrepartie anglaise.
 - Le design system vendoré sous `apps/web/src/design-system/` ne doit pas être reformaté ; consignez chaque écart délibéré dans son propre `README.md`.
+- Règles de sécurité : construisez les chemins d'API du web avec le gabarit étiqueté `apiPath` (`apps/web/src/lib/api-client.ts`), jamais par concaténation ; ne vérifiez un jeton d'accès que via `app.verifyAccessToken` ; faites passer chaque payload participant par `toParticipantQuestionView()` ; placez toute nouvelle limite dans `packages/shared/src/constants.ts`. Si vous relevez `UPLOAD_MAX_AUDIO_MB`, relevez aussi le plafond `request_body` de `/api` dans `deploy/Caddyfile`.
 
 ## Avant d'ouvrir une pull request
 
