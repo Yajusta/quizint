@@ -101,10 +101,16 @@ export const livePlugin = fp(
       if (!releaseSlot) return next(socketError('RATE_LIMITED', errorMessage('RATE_LIMITED')));
       // Freed (idempotently) on disconnect, on a refused handshake, or when the transport closes
       // before the namespace connection happens (socket.io then fires no `disconnect` at all).
-      socket.once('disconnect', releaseSlot);
-      socket.conn.once('close', releaseSlot);
-      const refuse = (code: string, message = errorMessage(code)) => {
+      // The transport listener is removed on release: one engine.io connection can carry several
+      // successive /participant sockets, and each would otherwise leave one behind.
+      const release = () => {
+        socket.conn.off('close', release);
         releaseSlot();
+      };
+      socket.once('disconnect', release);
+      socket.conn.once('close', release);
+      const refuse = (code: string, message = errorMessage(code)) => {
+        release();
         next(socketError(code, message));
       };
 

@@ -2,7 +2,11 @@
 
 import { z } from 'zod';
 
-import { SESSION_CODE_LENGTH } from '../constants.js';
+import {
+  PARTICIPANT_TOKEN_MAX_LENGTH,
+  PARTICIPANT_TOKEN_MIN_LENGTH,
+  SESSION_CODE_LENGTH,
+} from '../constants.js';
 import {
   AnswerPayload,
   AnswerSubmission,
@@ -356,7 +360,11 @@ export type SettingsUpdateCommand = z.infer<typeof SettingsUpdateCommand>;
 // Handshake auth payloads. A participant handshake without `token` is anonymous (it will
 // `participant:join`); one with a malformed token is refused TOKEN_INVALID.
 export const ParticipantResumeAuth = z.object({
-  token: z.string().regex(/^[A-Za-z0-9_-]{20,128}$/, 'Jeton invalide'), // base64url, 43 chars as issued
+  token: z
+    .string()
+    .min(PARTICIPANT_TOKEN_MIN_LENGTH, 'Jeton invalide')
+    .max(PARTICIPANT_TOKEN_MAX_LENGTH, 'Jeton invalide')
+    .regex(/^[A-Za-z0-9_-]+$/, 'Jeton invalide'), // base64url
 });
 export type ParticipantResumeAuth = z.infer<typeof ParticipantResumeAuth>;
 

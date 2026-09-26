@@ -39,6 +39,7 @@ import {
   INTERMEDIATE_RANKING_SIZE,
   SESSION_IDLE_TIMEOUT_MS,
   MAX_JOINS_PER_SECOND_PER_SESSION,
+  PARTICIPANT_TOKEN_BYTES,
   MAX_PARTICIPANTS_PER_SESSION,
   ENDED_PURGE_DELAY_MS,
 } from '@quiz/shared';
@@ -338,7 +339,7 @@ export class SessionManager {
       if (s.joinWindow.count >= MAX_JOINS_PER_SECOND_PER_SESSION) return refuse('RATE_LIMITED');
       s.joinWindow.count += 1;
 
-      const token = randomBytes(32).toString('base64url');
+      const token = randomBytes(PARTICIPANT_TOKEN_BYTES).toString('base64url');
       const tokenHash = sha256(token);
       const participant: ParticipantState = {
         id: randomUUID(),
@@ -528,7 +529,11 @@ export class SessionManager {
       return refuse('INTERNAL');
     }
 
-    this.invalidateDerived(s);
+    // Not invalidateDerived: an answer to the open question cannot change the visible ranking, which
+    // leaves that question out, so its cache holds for the whole opening (resume storms included).
+    this.roundCache.delete(s.sessionId);
+    this.rankingCache.delete(s.sessionId);
+    s.finalCache = null;
     participant.score += score.pointsAwarded;
     participant.answers.set(questionIndex, {
       payload,
@@ -1186,7 +1191,6 @@ export class SessionManager {
     const row = ranking.find((r) => r.participantId === p.id);
     const rank = row?.rank ?? ranking.length;
     const answer = q ? p.answers.get(s.currentQuestionIndex) : undefined;
-    const pending = s.phase === 'QUESTION_OPEN' ? (answer?.pointsAwarded ?? 0) : 0;
     return {
       sessionId: s.sessionId,
       code: s.code,
@@ -1194,7 +1198,7 @@ export class SessionManager {
       phase: s.phase,
       questionIndex: s.currentQuestionIndex,
       totalQuestions: s.quizSnapshot.questions.length,
-      you: { participantId: p.id, nickname: p.nickname, score: row?.score ?? p.score - pending, rank },
+      you: { participantId: p.id, nickname: p.nickname, score: row?.score ?? 0, rank },
       participantCount: ranking.length,
       question:
         q && s.phase === 'QUESTION_OPEN'

@@ -21,8 +21,11 @@
 		request_body {
 			max_size 16MiB
 		}
+		# `allow-downloads`: the CSV/JSON exports are opened in a new tab as attachment downloads, which
+		# a bare `sandbox` may block. Scripts, forms and popups stay forbidden, so a JSON body still
+		# renders inert.
 		header {
-			Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; sandbox"
+			Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; sandbox allow-downloads"
 			Cross-Origin-Resource-Policy same-origin
 			defer
 		}

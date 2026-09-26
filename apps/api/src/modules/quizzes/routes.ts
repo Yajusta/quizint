@@ -14,7 +14,7 @@ import {
 } from '@quiz/shared';
 
 import { apiError, slugify, validationError } from '../../lib/api.js';
-import { loadPlayedQuestionIds } from './played.js';
+import { loadPlayedQuestionIds, storedPlayedQuestionIds } from './played.js';
 
 const DEFAULT_SETTINGS = QuizSettings.parse({});
 
@@ -34,7 +34,9 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
    * not over still runs on the quiz.
    */
   const isQuizLocked = async (quiz: { id: string; playedQuestionIds: unknown }): Promise<boolean> =>
-    (await loadPlayedQuestionIds(app.prisma, quiz)).size > 0 || (await hasLiveSession(quiz.id));
+    storedPlayedQuestionIds(quiz.playedQuestionIds).length > 0 ||
+    (await app.prisma.question.count({ where: { quizId: quiz.id, answers: { some: {} } } })) > 0 ||
+    (await hasLiveSession(quiz.id));
 
   function getOwnedQuiz(quizId: string, adminId: string) {
     return app.prisma.quiz.findFirst({

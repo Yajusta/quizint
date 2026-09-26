@@ -13,6 +13,15 @@ export const MAX_JOINS_PER_SECOND_PER_SESSION = 30;
  */
 export const MAX_PARTICIPANT_SOCKETS_PER_IP = MAX_PARTICIPANTS_PER_SESSION + 100;
 
+/**
+ * Participant resume token: `randomBytes(PARTICIPANT_TOKEN_BYTES)` in base64url (43 chars as issued by
+ * the API; the mock server issues a 36-char UUID). The handshake schema accepts base64url within these
+ * bounds and refuses anything else as TOKEN_INVALID.
+ */
+export const PARTICIPANT_TOKEN_BYTES = 32;
+export const PARTICIPANT_TOKEN_MIN_LENGTH = 20;
+export const PARTICIPANT_TOKEN_MAX_LENGTH = 128;
+
 export const NICKNAME_MIN_LENGTH = 2;
 export const NICKNAME_MAX_LENGTH = 20;
 
