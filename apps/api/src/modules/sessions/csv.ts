@@ -12,18 +12,33 @@ interface SnapshotForCsv {
   }>;
 }
 
-function csvCell(value: string | number | null | undefined): string {
+export function csvCell(value: string | number | null | undefined): string {
   const s = value === null || value === undefined ? '' : String(value);
-  if (/[";\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  // ',' and tab are quoted too: a spreadsheet opened with another list separator must not split
+  // the cell and turn its tail into a cell of its own that starts with '='.
+  if (/[";,\t\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
   return s;
 }
 
 /**
- * Authored text (prompt, choice label, nickname, free answer) gets a leading quote when a
- * spreadsheet would read it as a formula. Not applied to the numbers `fr()` prints: «-5» stays.
+ * Characters a spreadsheet may skip before it looks for a formula trigger: ASCII whitespace and
+ * control characters, no-break and typographic spaces, zero-width characters and a stray BOM.
  */
-function formulaSafe(text: string): string {
-  return /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+const FORMULA_LEADING_NOISE = /^[\s\p{Cc}\p{Cf}\p{Zs}]*/u;
+/** Formula triggers (OWASP CSV injection), with the full-width forms some spreadsheets fold. */
+const FORMULA_TRIGGERS = /^[=+\-@\uFF1D\uFF0B\uFF0D\uFF20]/;
+/** A value opening on one of these is suspicious on its own (OWASP: tab, CR, LF). */
+const FORMULA_LEADING_CONTROL = /^[\t\r\n]/;
+
+/**
+ * Authored text (prompt, choice label, nickname, free answer) gets a leading quote when a
+ * spreadsheet could read it as a formula (OWASP CSV injection): a trigger `= + - @` first, or
+ * after leading blanks, control or invisible characters, or a value opening on tab, CR or LF.
+ * Not applied to the numbers `fr()` prints: «-5» stays.
+ */
+export function formulaSafe(text: string): string {
+  const unpadded = text.replace(FORMULA_LEADING_NOISE, '');
+  return FORMULA_LEADING_CONTROL.test(text) || FORMULA_TRIGGERS.test(unpadded) ? `'${text}` : text;
 }
 
 function fr(n: number): string {

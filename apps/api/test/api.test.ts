@@ -2,11 +2,14 @@
 // The test database is a throwaway file recreated from scratch by the `pretest` script on every run.
 // Run: pnpm --filter @quiz/api test   (DATABASE_URL is set by vitest.config.ts, no .env needed)
 
+import { crc32, deflateSync } from 'node:zlib';
+
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hash } from 'argon2';
 
 import {
   ENDED_PURGE_DELAY_MS,
+  IMAGE_MAX_INPUT_PIXELS,
   MAX_JOINS_PER_SECOND_PER_SESSION,
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
@@ -469,6 +472,139 @@ describe('media', () => {
       cookies: cookiesObject(cookies),
     });
     expect(del.statusCode).toBe(204);
+  });
+
+  it('a percent-encoded media path still requires authentication; /uploads stays public', async () => {
+    const boundary = 'vitest-boundary-anon';
+    const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+    const payload = Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="x.gif"\r\n` +
+          'Content-Type: image/gif\r\n\r\n',
+      ),
+      gif,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]);
+    const headers = { 'content-type': `multipart/form-data; boundary=${boundary}` };
+    const before = await app.prisma.media.count();
+    for (const url of ['/api/v1/media', '/api/v1/%6Dedia', '/api/v1/m%65dia', '/api/v1/%6D%65dia']) {
+      const res = await app.inject({ method: 'POST', url, headers, payload });
+      expect(res.statusCode, url).toBe(401);
+    }
+    for (const url of [
+      '/api/v1/media/00000000-0000-4000-8000-000000000000',
+      '/api/v1/%6Dedia/00000000-0000-4000-8000-000000000000',
+    ]) {
+      const res = await app.inject({ method: 'DELETE', url });
+      expect(res.statusCode, url).toBe(401);
+    }
+    expect(await app.prisma.media.count()).toBe(before);
+    // The static route is outside the media plugin's guard: a missing file is a 404, not a 401.
+    const statics = await app.inject({ method: 'GET', url: '/uploads/does-not-exist.webp' });
+    expect(statics.statusCode).toBe(404);
+  });
+
+  /** Multipart body from raw parts: `file` parts carry a filename, the others are plain fields. */
+  const multipartBody = (
+    boundary: string,
+    parts: Array<{ name: string; value: Buffer | string; filename?: string }>,
+  ) =>
+    Buffer.concat([
+      ...parts.flatMap((p) => [
+        Buffer.from(
+          `--${boundary}\r\nContent-Disposition: form-data; name="${p.name}"` +
+            (p.filename ? `; filename="${p.filename}"\r\nContent-Type: application/octet-stream` : '') +
+            '\r\n\r\n',
+        ),
+        Buffer.isBuffer(p.value) ? p.value : Buffer.from(p.value),
+        Buffer.from('\r\n'),
+      ]),
+      Buffer.from(`--${boundary}--\r\n`),
+    ]);
+  const gifBytes = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
+  const upload = (boundary: string, payload: Buffer) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/media',
+      cookies: cookiesObject(cookies),
+      headers: { 'content-type': `multipart/form-data; boundary=${boundary}` },
+      payload,
+    });
+
+  it('stray fields and a first file under another name are drained, not left hanging', async () => {
+    const boundary = 'vitest-boundary-drain';
+    const res = await upload(
+      boundary,
+      multipartBody(boundary, [
+        { name: 'note', value: 'bonjour' },
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+        { name: 'after', value: 'ignored' },
+      ]),
+    );
+    expect(res.statusCode).toBe(201);
+    await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/media/${res.json().media.id}`,
+      cookies: cookiesObject(cookies),
+    });
+
+    // A file under another field name is drained; the request then ends with no "file": 400.
+    const other = await upload(
+      boundary,
+      multipartBody(boundary, [{ name: 'avatar', value: gifBytes, filename: 'b.gif' }]),
+    );
+    expect(other.statusCode).toBe(400);
+  });
+
+  it('multipart bounds: a second file or too many parts is a 413', async () => {
+    const boundary = 'vitest-boundary-limits';
+    const twoFiles = await upload(
+      boundary,
+      multipartBody(boundary, [
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+        { name: 'file', value: gifBytes, filename: 'b.gif' },
+      ]),
+    );
+    expect(twoFiles.statusCode).toBe(413);
+    const manyFields = await upload(
+      boundary,
+      multipartBody(boundary, [
+        ...Array.from({ length: 10 }, (_, i) => ({ name: `f${i}`, value: 'x' })),
+        { name: 'file', value: gifBytes, filename: 'a.gif' },
+      ]),
+    );
+    expect(manyFields.statusCode).toBe(413);
+  });
+
+  it('an image whose header claims more than IMAGE_MAX_INPUT_PIXELS is refused before decoding', async () => {
+    // A valid PNG signature and IHDR claiming 10 000 × 10 000 (100 MP), then an empty IDAT:
+    // sharp reads the size from the header and refuses before allocating anything.
+    const chunk = (type: string, data: Buffer) => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32BE(data.length);
+      const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+      const crc = Buffer.alloc(4);
+      crc.writeUInt32BE(crc32(body));
+      return Buffer.concat([len, body, crc]);
+    };
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(10_000, 0);
+    ihdr.writeUInt32BE(10_000, 4);
+    ihdr.set([8, 2, 0, 0, 0], 8); // 8-bit RGB, no interlace
+    const png = Buffer.concat([
+      Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      chunk('IHDR', ihdr),
+      chunk('IDAT', deflateSync(Buffer.alloc(0))),
+      chunk('IEND', Buffer.alloc(0)),
+    ]);
+    expect(10_000 * 10_000).toBeGreaterThan(IMAGE_MAX_INPUT_PIXELS);
+    const boundary = 'vitest-boundary-bomb';
+    const res = await upload(
+      boundary,
+      multipartBody(boundary, [{ name: 'file', value: png, filename: 'b.png' }]),
+    );
+    expect(res.statusCode).toBe(415);
+    expect(res.json().error.code).toBe('MEDIA_UNSUPPORTED_TYPE');
   });
 
   it('a question pointing at a media the library no longer holds is a 400 naming the question', async () => {
@@ -1123,6 +1259,145 @@ describe('live engine', () => {
     });
     expect(res.statusCode).toBe(423);
     expect(res.json().error.details.reason).toBe('correct answer changed');
+  });
+
+  it('deleting the played session keeps the quiz locked; duplication stays the escape hatch', async () => {
+    const quiz = await createQuiz('Quiz joué puis purgé', [mcq(), numeric()]);
+    const { sessionId, code, s } = await createLiveSession(quiz.id);
+    const { participant } = await joinAs(code, 'Rgpd');
+    await app.sessionManager.startSession(s, false);
+    const choiceId = s.quizSnapshot.questions[0]!.choices[0]!.id;
+    expect((await app.sessionManager.submitAnswer(s, participant, 0, { choiceId })).ok).toBe(true);
+
+    // Deleted while still running: the route ends it, records the answered question, then deletes.
+    const gone = await app.inject({
+      method: 'DELETE',
+      url: `/api/v1/sessions/${sessionId}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(gone.statusCode).toBe(204);
+    expect(await app.prisma.answer.count({ where: { sessionId } })).toBe(0);
+
+    const [played, unplayed] = quiz.questions as [
+      (typeof quiz.questions)[number],
+      (typeof quiz.questions)[number],
+    ];
+    const flipped = [
+      mcq({
+        id: played.id,
+        choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
+      }),
+      numeric({ id: unplayed.id }),
+    ];
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quiz.id}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: { questions: flipped },
+    });
+    expect(res.statusCode).toBe(423);
+    expect(res.json().error.code).toBe('QUIZ_LOCKED');
+    expect(res.json().error.details).toEqual({ questionId: played.id, reason: 'correct answer changed' });
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/quizzes/${quiz.id}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(detail.json().quiz.isLocked).toBe(true);
+
+    // The question never answered is still editable next to the unchanged played one.
+    const editUnplayed = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quiz.id}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: {
+        questions: [
+          mcq({
+            id: played.id,
+            choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: c.isCorrect })),
+          }),
+          numeric({ id: unplayed.id, prompt: 'Combien, vraiment ?' }),
+        ],
+      },
+    });
+    expect(editUnplayed.statusCode).toBe(200);
+
+    // The duplicate is a fresh, unplayed quiz: the same change goes through there.
+    const dup = await app.inject({
+      method: 'POST',
+      url: `/api/v1/quizzes/${quiz.id}/duplicate`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(dup.statusCode).toBe(201);
+    const copyId = dup.json().quiz.id as string;
+    const copy = await app.inject({
+      method: 'GET',
+      url: `/api/v1/quizzes/${copyId}`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(copy.json().quiz.isLocked).toBe(false);
+    const [copyPlayed, copyUnplayed] = copy.json().quiz.questions as Array<{
+      id: string;
+      choices: Array<{ id: string; label: string; isCorrect: boolean }>;
+    }>;
+    const copyFlip = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${copyId}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: {
+        questions: [
+          mcq({
+            id: copyPlayed!.id,
+            choices: copyPlayed!.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
+          }),
+          numeric({ id: copyUnplayed!.id }),
+        ],
+      },
+    });
+    expect(copyFlip.statusCode).toBe(200);
+  });
+
+  it('the lock is re-asserted inside the save transaction (a session created mid-save wins)', async () => {
+    const quiz = await createQuiz('Quiz TOCTOU', [mcq(), numeric()]);
+    const first = quiz.questions[0]!;
+    const keptMcq = {
+      ...mcq({ choices: first.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: c.isCorrect })) }),
+      id: first.id,
+    };
+    // The check has run (no session, nothing answered); a session opens before the transaction.
+    const real = app.prisma;
+    let sessionId = '';
+    const racing = new Proxy(real, {
+      get(target, key) {
+        if (key !== '$transaction') return bound(target, key);
+        return async (arg: unknown) => {
+          const session = await createLiveSession(quiz.id);
+          sessionId = session.sessionId;
+          return (target.$transaction as (a: unknown) => Promise<unknown>).call(target, arg);
+        };
+      },
+    });
+    const decorated = app as unknown as { prisma: typeof real };
+    decorated.prisma = racing;
+    let res;
+    try {
+      res = await app.inject({
+        method: 'PUT',
+        url: `/api/v1/quizzes/${quiz.id}/questions`,
+        cookies: cookiesObject(cookies),
+        payload: { questions: [keptMcq] }, // drops the numeric question
+      });
+    } finally {
+      decorated.prisma = real;
+    }
+    expect(res.statusCode).toBe(423);
+    expect(res.json().error).toMatchObject({
+      code: 'QUIZ_LOCKED',
+      details: { reason: 'lock changed during save' },
+    });
+    // Nothing was written: the numeric question the snapshot names is still there.
+    expect(await app.prisma.question.count({ where: { quizId: quiz.id } })).toBe(2);
+    expect(sessionId).not.toBe('');
   });
 
   it('answers:progress reaches the final count, latest answers first', async () => {

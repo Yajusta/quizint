@@ -58,3 +58,18 @@ export const CLOCK_SYNC_SAMPLES = 5;
 // A–F letters of the choices. Answer boxes are deliberately identical: no colour per choice,
 // the letter is the only marker (§8.5).
 export const CHOICE_LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'] as const;
+
+// Upload hardening (security audit, lot C).
+/**
+ * Decoded-pixel cap handed to sharp (`limitInputPixels`), checked from the header before any
+ * decode: a decompression bomb (a few kB of PNG claiming 50 000 × 50 000) is refused instead of
+ * allocating gigabytes. 40 MP stays above anything an admin legitimately uploads (a 24 MP camera
+ * photo, an 8K frame at 33 MP) while bounding a decode to ~160 MB of RGBA, far under sharp's own
+ * default of 268 MP. For an animated GIF the count covers every frame (width × height × pages).
+ */
+export const IMAGE_MAX_INPUT_PIXELS = 40_000_000;
+/** Multipart bounds of POST /media: one file, a couple of stray fields at most, tiny values. */
+export const UPLOAD_MULTIPART_MAX_FILES = 1;
+export const UPLOAD_MULTIPART_MAX_FIELDS = 4;
+export const UPLOAD_MULTIPART_MAX_PARTS = 5;
+export const UPLOAD_MULTIPART_MAX_FIELD_SIZE = 1024; // bytes per non-file field value
