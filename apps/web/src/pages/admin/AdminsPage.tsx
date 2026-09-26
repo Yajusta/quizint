@@ -9,7 +9,7 @@ import { z } from 'zod';
 
 import { ADMIN_PASSWORD_MIN_LENGTH as PASSWORD_MIN, type AdminDTO } from '@quiz/shared';
 
-import { apiJson, ApiErrorThrown } from '../../lib/api-client.ts';
+import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { NBSP } from '../../lib/format.ts';
 import { Badge, Button, Card, Dialog, Field, Input } from '../../design-system/index.ts';
 import { ListSkeleton } from '../../components/Skeletons.tsx';
@@ -107,7 +107,7 @@ export function AdminsPage() {
     setToggling(true);
     try {
       await apiJson.patch(
-        `/admins/${admin.id}`,
+        apiPath`/admins/${admin.id}`,
         { isActive: !admin.isActive },
         z.object({ admin: z.object({ id: z.string() }) }),
       );

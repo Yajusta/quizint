@@ -319,8 +319,10 @@ export interface Draft {
   at: number;
 }
 
+const DRAFT_PREFIX = 'quiz:draft:';
+
 export function draftKey(quizId: string | null): string {
-  return `quiz:draft:${quizId ?? 'new'}`;
+  return `${DRAFT_PREFIX}${quizId ?? 'new'}`;
 }
 
 export function readDraft(key: string): Draft | null {
@@ -357,5 +359,22 @@ export function clearDraft(key: string): void {
     localStorage.removeItem(key);
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Drops every local draft. Called on logout: a draft carries the correct answers, and on a shared
+ * projection PC the next admin to sign in must not find the previous one's work in storage.
+ */
+export function clearAllDrafts(): void {
+  try {
+    const keys: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key?.startsWith(DRAFT_PREFIX)) keys.push(key);
+    }
+    for (const key of keys) localStorage.removeItem(key);
+  } catch {
+    // storage unavailable — nothing was persisted there either
   }
 }

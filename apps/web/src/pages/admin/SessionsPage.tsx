@@ -7,7 +7,7 @@ import { useNavigate } from 'react-router';
 
 import { z } from 'zod';
 
-import { apiJson, ApiErrorThrown } from '../../lib/api-client.ts';
+import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { formatDate, formatNumber, NBSP } from '../../lib/format.ts';
 import { Badge, Button, Card, Dialog, EmptyState, IconButton, Tabs } from '../../design-system/index.ts';
 import { ListSkeleton } from '../../components/Skeletons.tsx';
@@ -28,7 +28,7 @@ export function SessionsPage() {
 
   const remove = async (session: Session) => {
     try {
-      await apiJson.delete(`/sessions/${session.id}`, z.unknown());
+      await apiJson.delete(apiPath`/sessions/${session.id}`, z.unknown());
       setSessions((list) => list.filter((s) => s.id !== session.id));
       setError(null);
     } catch (e) {

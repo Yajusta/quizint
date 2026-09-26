@@ -10,6 +10,8 @@ apps/api/uploads
 **/*.db-wal
 **/*.db-shm
 **/.env
+**/.env.*
+!**/.env.example
 test-results
 playwright-report
 coverage

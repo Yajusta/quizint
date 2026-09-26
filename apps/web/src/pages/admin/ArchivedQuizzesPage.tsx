@@ -7,7 +7,7 @@ import { useNavigate } from 'react-router';
 
 import { z } from 'zod';
 
-import { apiJson, ApiErrorThrown } from '../../lib/api-client.ts';
+import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { formatDate, formatNumber, NBSP } from '../../lib/format.ts';
 import { Button, Card, Dialog, EmptyState } from '../../design-system/index.ts';
 import { ListSkeleton } from '../../components/Skeletons.tsx';
@@ -69,10 +69,14 @@ export function ArchivedQuizzesPage() {
   };
 
   const restore = (quiz: ArchivedQuiz) =>
-    act(quiz, () => apiJson.post(`/quizzes/${quiz.id}/restore`, {}, NoContent), t('archived.restoreError'));
+    act(
+      quiz,
+      () => apiJson.post(apiPath`/quizzes/${quiz.id}/restore`, {}, NoContent),
+      t('archived.restoreError'),
+    );
 
   const remove = (quiz: ArchivedQuiz) =>
-    act(quiz, () => apiJson.delete(`/quizzes/${quiz.id}`, NoContent), t('errors.delete'));
+    act(quiz, () => apiJson.delete(apiPath`/quizzes/${quiz.id}`, NoContent), t('errors.delete'));
 
   return (
     <AdminLayout>
