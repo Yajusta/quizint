@@ -13,8 +13,9 @@ model Admin {
   passwordHash      String
   displayName       String
   isActive          Boolean        @default(true)
-  // Credential version: set on every password change, carried by each access JWT (claim `pca`).
-  // A JWT whose claim differs was issued before the change and is refused.
+  // Credential version: bumped on every password change AND every deactivation, carried by each
+  // access JWT (claim `pca`) and refresh token (`credentialVersion`). A token whose copy differs was
+  // issued before the bump and is refused forever, reactivation included (which does not bump).
   passwordChangedAt DateTime?
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt

@@ -29,7 +29,7 @@ const REFRESH_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
  * mint a second, independent refresh token that no reuse check would ever catch. Logout and theft
  * detection expire the token outright, so neither is covered by the grace.
  */
-const REFRESH_ROTATION_GRACE_MS = 10_000;
+export const REFRESH_ROTATION_GRACE_MS = 10_000;
 
 // Every access JWT is HS256, issued by this API for the admin back-office. Pinned on both ends:
 // verification refuses any other algorithm, issuer or audience.
@@ -72,10 +72,21 @@ export function sameCredentialVersion(
   return ms === (current?.getTime() ?? null);
 }
 
-/** A refresh token `verifyRefreshToken` accepted, with its (active, same-version) admin. */
+/**
+ * The credential version a bump writes: now, but always strictly past the current one, so two bumps
+ * in the same millisecond (or across a clock stepped back) never share a version — a token minted
+ * under the first would otherwise pass the check after the second.
+ */
+export function nextCredentialVersion(current: Date | null): Date {
+  return new Date(Math.max(Date.now(), (current?.getTime() ?? -Infinity) + 1));
+}
+
+/**
+ * A refresh token `verifyRefreshToken` accepted, with its (active, same-version) admin: the row's
+ * credential version is `admin.passwordChangedAt` by construction, so it is not repeated here.
+ */
 export interface RefreshTokenCheck {
   id: string;
-  credentialVersion: Date | null;
   admin: Admin;
 }
 
@@ -189,8 +200,9 @@ async function plugin(app: FastifyInstance): Promise<void> {
    * window, or the loser of two concurrent refreshes) yields `null` and no cookie — one token in, at
    * most one token out.
    * `credentialVersion` is the admin's `passwordChangedAt` the family was opened under: read from the
-   * admin at login and change-password, inherited from the presented row on a rotation — never
-   * re-read from the admin there, or a rotation racing a password change would adopt the new one.
+   * admin at login and change-password; on a rotation, the admin row verifyRefreshToken read, which
+   * that check just proved equal to the presented row's version (a bump landing after the read leaves
+   * the successor on the old version, refused at its next use).
    */
   app.decorate(
     'issueRefreshToken',
@@ -229,7 +241,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
       // Opportunistic purge: every rotation leaves a dead row behind (expired 7 days later, revoked
       // at once), nothing else would ever remove them. Failure here must not fail the refresh.
       app.prisma.refreshToken
-        .deleteMany({ where: { adminId, expiresAt: { lt: new Date() } } })
+        .deleteMany({ where: { adminId, expiresAt: { lte: new Date() } } })
         .catch((err: unknown) => app.log.error({ err, adminId }, 'refresh token purge failed'));
       reply.setCookie(REFRESH_TOKEN_COOKIE, token, cookieOpts(REFRESH_TTL_SEC));
       return token;
@@ -238,9 +250,10 @@ async function plugin(app: FastifyInstance): Promise<void> {
 
   /**
    * Ends every session of an admin: refresh tokens revoked and expired (no rotation grace), and
-   * their presenter sockets disconnected. Called on password change and deactivation. Access JWTs
-   * are covered by `verifyAccessToken`: it re-checks `isActive` and the credential version
-   * (`passwordChangedAt`) on every request, so a JWT signed before either change is refused at once.
+   * their presenter sockets disconnected. Called on password change and deactivation, both of which
+   * bump the credential version (`passwordChangedAt`) first. Access JWTs are covered by
+   * `verifyAccessToken`: it re-checks `isActive` and the credential version on every request, so a
+   * JWT signed before either change is refused at once — and still after a reactivation.
    * Refresh tokens do not rely on this sweep alone either: verifyRefreshToken re-checks `isActive`
    * and the row's `credentialVersion`, so a successor minted by a rotation racing the sweep is refused.
    */
@@ -260,16 +273,19 @@ async function plugin(app: FastifyInstance): Promise<void> {
     const token = req.cookies[REFRESH_TOKEN_COOKIE];
     if (!token) return null;
     const row = await app.prisma.refreshToken.findUnique({ where: { tokenHash: sha256(token) } });
-    if (!row || row.expiresAt < new Date()) return null;
-    // A family opened under an older password, or of an inactive admin, is dead whatever the sweep
-    // caught (a rotation racing it may have left a live successor). Checked before the reuse branch:
-    // a token rotated before a password change is not a theft signal about the sessions opened
-    // since, and replaying it must not revoke them.
+    // Dead at its exact expiry instant: logout and revokeAdminSessions set `expiresAt = revokedAt`,
+    // and a strict `<` would let that token through (into the grace path) within the same millisecond.
+    if (!row || row.expiresAt.getTime() <= Date.now()) return null;
+    // A family opened under an older credential version (a password change or a deactivation since),
+    // or of an inactive admin, is dead whatever the sweep caught (a rotation racing it may have left a
+    // live successor). Checked before the reuse branch: a token rotated before a password change is
+    // not a theft signal about the sessions opened since, and replaying it must not revoke them.
     const admin = await app.prisma.admin.findUnique({ where: { id: row.adminId } });
     if (!admin?.isActive || !sameCredentialVersion(row.credentialVersion, admin.passwordChangedAt)) {
       return null;
     }
-    if (row.revokedAt && Date.now() - row.revokedAt.getTime() > REFRESH_ROTATION_GRACE_MS) {
+    // The grace is [revokedAt, revokedAt + GRACE): at its end instant a replay is already reuse.
+    if (row.revokedAt && Date.now() - row.revokedAt.getTime() >= REFRESH_ROTATION_GRACE_MS) {
       // Reuse detected: revoke every token of this admin's family. Expired as well, so the grace
       // window above (a *rotation* revocation) never lets a stolen family through.
       const at = new Date();
@@ -281,7 +297,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
     }
     // Fresh, or revoked within the grace window by a concurrent rotation: the caller issues an access
     // token, and issueRefreshToken mints a successor only for a token that was still live.
-    return { id: row.id, credentialVersion: row.credentialVersion, admin };
+    return { id: row.id, admin };
   });
 
   app.decorate('clearAuthCookies', (reply: FastifyReply) => {

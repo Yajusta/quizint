@@ -51,7 +51,13 @@ export class LoginFailureTracker {
   constructor(
     private readonly maxTracked: number = LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX,
     private readonly now: () => number = Date.now,
-  ) {}
+  ) {
+    // countFailure evicts until `size < maxTracked`: below 1 (or NaN) that never holds on an empty
+    // map, and the eviction loop would spin forever.
+    if (!Number.isInteger(maxTracked) || maxTracked < 1) {
+      throw new RangeError(`LoginFailureTracker maxTracked must be an integer >= 1, got ${maxTracked}`);
+    }
+  }
 
   private static key(email: string): string {
     return sha256(email);

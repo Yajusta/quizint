@@ -20,6 +20,7 @@ import {
 } from '../../lib/api.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
 import { LoginFailureTracker } from '../../lib/rate-limit.js';
+import { nextCredentialVersion } from '../../plugins/auth.js';
 
 function toAdminDTO(a: {
   id: string;
@@ -89,9 +90,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // --- POST /api/v1/auth/refresh -------------------------------------------
   app.post('/auth/refresh', async (req, reply) => {
-    // verifyRefreshToken also refuses an inactive admin and a family opened under an older password
-    // (a rotation racing revokeAdminSessions may have minted a live successor): such a row gets
-    // nothing, not even the access token of the grace path below.
+    // verifyRefreshToken also refuses an inactive admin and a family opened under an older credential
+    // version, i.e. before a password change or a deactivation (a rotation racing revokeAdminSessions
+    // may have minted a live successor): such a row gets nothing, not even the access token of the
+    // grace path below.
     const check = await app.verifyRefreshToken(req);
     if (!check) {
       app.clearAuthCookies(reply);
@@ -102,8 +104,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // A replay inside the rotation grace gets an access token only (issueRefreshToken returns null):
     // the refresh token minted by the first rotation is already in this browser's cookie jar, and a
     // stolen copy must not mint a second, independent one (see REFRESH_ROTATION_GRACE_MS). The
-    // successor inherits the row's credential version, never re-read from the admin.
-    await app.issueRefreshToken(reply, admin.id, check.credentialVersion, check.id);
+    // successor inherits the row's credential version: verifyRefreshToken only accepts a row whose
+    // version equals the admin's passwordChangedAt as read in that same check, so the two are one
+    // value (a password change landing after that read is caught by the version check next time).
+    await app.issueRefreshToken(reply, admin.id, admin.passwordChangedAt, check.id);
     return { admin: toAdminDTO(admin) };
   });
 
@@ -167,19 +171,36 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       const target = await app.prisma.admin.findUnique({ where: { id: req.params.id } });
       if (!target) return reply.status(404).send(apiError('NOT_FOUND'));
-      if (parsed.data.isActive === false && target.id === req.adminId) {
+      const deactivating = parsed.data.isActive === false;
+      // Self-deactivation is refused, so the credential bump below never hits the caller's own session.
+      if (deactivating && target.id === req.adminId) {
         return reply.status(409).send(apiError('CANNOT_DEACTIVATE_SELF'));
       }
-      const admin = await app.prisma.admin.update({
-        where: { id: req.params.id },
-        data: {
-          ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
-          ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
-        },
+      // A deactivation bumps the credential version in the same transaction: every access JWT and
+      // refresh token issued before it is refused for good, not only while `isActive` is false — a
+      // copied cookie does not come back to life on reactivation, and a login racing this update mints
+      // tokens under the old version. The version is read in the transaction and moved strictly past
+      // it, so a password change committed in the same millisecond cannot end up sharing it.
+      // Reactivation does not bump: nothing is live to revoke.
+      const admin = await app.prisma.$transaction(async (tx) => {
+        const current = deactivating
+          ? await tx.admin.findUniqueOrThrow({
+              where: { id: req.params.id },
+              select: { passwordChangedAt: true },
+            })
+          : null;
+        return tx.admin.update({
+          where: { id: req.params.id },
+          data: {
+            ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
+            ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
+            ...(current ? { passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) } : {}),
+          },
+        });
       });
       // A deactivation ends the account's sessions, whoever holds them. There is no password field
       // here (AdminPatchInput is strict): nobody resets a colleague's password.
-      if (parsed.data.isActive === false) {
+      if (deactivating) {
         await app.revokeAdminSessions(admin.id);
       }
       return { admin: toAdminDTO(admin) };
@@ -215,11 +236,24 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       const ok = await verifyPassword(admin.passwordHash, parsed.data.currentPassword);
       if (!ok) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
       // passwordChangedAt is the credential version every access JWT carries: bumping it refuses all
-      // the JWTs signed before, this request's own included.
-      const updated = await app.prisma.admin.update({
-        where: { id: admin.id },
-        data: { passwordHash: await hashPassword(parsed.data.newPassword), passwordChangedAt: new Date() },
+      // the JWTs signed before, this request's own included. Conditional on the version and status read
+      // above: a deactivation (or another password change) landing during the hashing already bumped
+      // the version, and this request must not mint tokens under a newer one — they would come back
+      // to life on reactivation.
+      const passwordHash = await hashPassword(parsed.data.newPassword);
+      const passwordChangedAt = nextCredentialVersion(admin.passwordChangedAt);
+      const { count } = await app.prisma.admin.updateMany({
+        where: { id: admin.id, isActive: true, passwordChangedAt: admin.passwordChangedAt },
+        data: { passwordHash, passwordChangedAt },
       });
+      if (count === 0) {
+        // Lost the race. Answered like a wrong current password — which it now is after a concurrent
+        // change (a double submit) — so the client neither refreshes nor retries; the cookies are left
+        // alone, as clearing them could land after, and wipe, the ones the winning request just set.
+        // After a deactivation the next request gets its 401 from authenticate anyway.
+        return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
+      }
+      const updated = { ...admin, passwordHash, passwordChangedAt };
       // Every other session of this account ends (a stolen refresh cookie or access JWT included);
       // this browser gets fresh cookies so the admin who just changed their password stays signed in.
       await app.revokeAdminSessions(admin.id);

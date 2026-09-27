@@ -22,7 +22,7 @@ import {
 import { buildApp } from '../src/app.js';
 import { trustCaddyHop } from '../src/lib/proxy.js';
 import { getConfig } from '../src/config.js';
-import { JWT_AUDIENCE, JWT_ISSUER } from '../src/plugins/auth.js';
+import { JWT_AUDIENCE, JWT_ISSUER, REFRESH_ROTATION_GRACE_MS } from '../src/plugins/auth.js';
 import { allowedOrigins } from '../src/plugins/csrf.js';
 import { sha256 } from '../src/lib/api.js';
 import { SessionManager } from '../src/modules/live/SessionManager.js';
@@ -1129,6 +1129,166 @@ describe('refresh token credential version', () => {
       await app.prisma.admin.delete({ where: { id: raceId } });
     }
   }, 60_000);
+});
+
+describe('deactivation revokes issued credentials', () => {
+  // A dedicated admin (A) deactivated and reactivated by the suite's own (B), from its own
+  // documentation-range addresses: the login route allows 10 per minute and per IP.
+  const email = 'revoked@example.fr';
+  const password = 'revoked-pass-12';
+  const remoteAddress = '198.18.0.1';
+  let nextIp = 10;
+  const login = () =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `198.18.0.${nextIp++}`,
+      payload: { email, password },
+    });
+  const refresh = (c: Record<string, string>) =>
+    app.inject({ method: 'POST', url: '/api/v1/auth/refresh', remoteAddress, cookies: c });
+  const me = (c: Record<string, string>) =>
+    app.inject({ method: 'GET', url: '/api/v1/auth/me', remoteAddress, cookies: c });
+  const setActive = (isActive: boolean) =>
+    app.inject({
+      method: 'PATCH',
+      url: `/api/v1/admins/${adminId}`,
+      remoteAddress,
+      cookies: cookiesObject(cookies),
+      payload: { isActive },
+    });
+  const currentVersion = async () =>
+    (await app.prisma.admin.findUniqueOrThrow({ where: { id: adminId } })).passwordChangedAt;
+  /** A refresh row planted for A, under its current credential version unless one is given. */
+  const plant = async (expiresAt: Date, revokedAt: Date | null, credentialVersion?: Date | null) => {
+    const token = `planted-${Math.random().toString(36).slice(2)}`;
+    await app.prisma.refreshToken.create({
+      data: {
+        adminId,
+        tokenHash: sha256(token),
+        expiresAt,
+        revokedAt,
+        credentialVersion: credentialVersion === undefined ? await currentVersion() : credentialVersion,
+      },
+    });
+    return token;
+  };
+  let adminId = '';
+
+  beforeAll(async () => {
+    adminId = (
+      await app.prisma.admin.create({
+        data: { email, displayName: 'Révoqué', passwordHash: await hash(password) },
+      })
+    ).id;
+  });
+
+  afterAll(async () => {
+    vi.useRealTimers();
+    await app.prisma.admin.delete({ where: { email } }).catch(() => undefined);
+  });
+
+  it('a deactivate + reactivate cycle does not bring earlier tokens back', async () => {
+    const res = await login();
+    expect(res.statusCode).toBe(200);
+    const old = cookiesObject(setCookieOf(res));
+    expect((await me(old)).statusCode).toBe(200);
+
+    expect((await setActive(false)).statusCode).toBe(200);
+    expect((await setActive(true)).statusCode).toBe(200);
+
+    // Reactivated, yet the tokens issued before the deactivation stay dead: the access JWT…
+    expect((await me(old)).statusCode).toBe(401);
+    // …and the refresh token, a copy kept outside the cookie jar as well: the sweep expired the row,
+    // and the credential version would refuse it even if a rotation racing the sweep had left it live.
+    await app.prisma.refreshToken.update({
+      where: { tokenHash: sha256(old.refresh_token!) },
+      data: { revokedAt: null, expiresAt: new Date(Date.now() + 60_000) },
+    });
+    const replay = await refresh(old);
+    expect(replay.statusCode).toBe(401);
+    expect(replay.cookies.some((c) => c.name === 'access_token' && c.value !== '')).toBe(false);
+
+    // A signs in afresh without trouble.
+    const again = await login();
+    expect(again.statusCode).toBe(200);
+    const fresh = cookiesObject(setCookieOf(again));
+    expect((await me(fresh)).statusCode).toBe(200);
+    expect((await refresh(fresh)).statusCode).toBe(200);
+  });
+
+  it('a login racing a deactivation leaves nothing usable after reactivation', async () => {
+    // The login read A as active and minted under the old version; the deactivation landed first.
+    const oldVersion = await currentVersion();
+    expect((await setActive(false)).statusCode).toBe(200);
+    const token = await plant(new Date(Date.now() + 60_000), null, oldVersion);
+    expect((await setActive(true)).statusCode).toBe(200);
+    expect((await refresh({ refresh_token: token })).statusCode).toBe(401);
+  });
+
+  it('a refresh token is dead at its exact expiry instant', async () => {
+    const at = new Date(Date.now() + 5_000);
+    // What logout and revokeAdminSessions leave: revokedAt = expiresAt. At that very millisecond it
+    // must not slip into the rotation grace.
+    const loggedOut = await plant(at, at);
+    const expiring = await plant(at, null);
+    vi.useFakeTimers({ toFake: ['Date'], now: at });
+    try {
+      expect((await refresh({ refresh_token: loggedOut })).statusCode).toBe(401);
+      expect((await refresh({ refresh_token: expiring })).statusCode).toBe(401);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('the rotation grace ends at its exact end instant', async () => {
+    const at = new Date(Date.now() + 5_000);
+    const rotated = await plant(
+      new Date(at.getTime() + 60_000),
+      new Date(at.getTime() - REFRESH_ROTATION_GRACE_MS),
+    );
+    vi.useFakeTimers({ toFake: ['Date'], now: at });
+    try {
+      expect((await refresh({ refresh_token: rotated })).statusCode).toBe(401);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a deactivation moves the credential version strictly past the current one', async () => {
+    // A version at or ahead of the clock (a bump in the same millisecond, a clock stepped back): a
+    // plain `new Date()` would rewrite the same value, and tokens minted under it would survive.
+    const ahead = new Date(Date.now() + 60_000);
+    await app.prisma.admin.update({ where: { id: adminId }, data: { passwordChangedAt: ahead } });
+    expect((await setActive(false)).statusCode).toBe(200);
+    expect((await currentVersion())!.getTime()).toBe(ahead.getTime() + 1);
+    expect((await setActive(true)).statusCode).toBe(200);
+  });
+
+  // Last: it changes A's password.
+  it('a password change racing a deactivation mints nothing that survives reactivation', async () => {
+    const res = await login();
+    expect(res.statusCode).toBe(200);
+    const session = cookiesObject(setCookieOf(res));
+    // The deactivation lands while change-password verifies and hashes (two Argon2id runs).
+    const [changed, deactivated] = await Promise.all([
+      app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/change-password',
+        remoteAddress,
+        cookies: session,
+        payload: { currentPassword: password, newPassword: 'revoked-pass-34' },
+      }),
+      setActive(false),
+    ]);
+    expect(deactivated.statusCode).toBe(200);
+    expect([204, 401]).toContain(changed.statusCode);
+    expect((await setActive(true)).statusCode).toBe(200);
+    // Whichever won, the cookies change-password may have handed back are dead after reactivation.
+    const handed = { ...session, ...cookiesObject(setCookieOf(changed)) };
+    expect((await me(handed)).statusCode).toBe(401);
+    if (handed.refresh_token) expect((await refresh(handed)).statusCode).toBe(401);
+  });
 });
 
 describe('change-password rate limit', () => {

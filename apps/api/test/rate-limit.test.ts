@@ -73,6 +73,17 @@ describe('LoginFailureTracker', () => {
     expect(fresh.size).toBe(0);
   });
 
+  it('refuses a cap below one instead of spinning in its eviction loop', () => {
+    for (const bad of [0, -1, 0.5, Number.NaN]) {
+      expect(() => new LoginFailureTracker(bad)).toThrow(RangeError);
+    }
+    // The smallest cap works: one entry, replaced by the next.
+    const { t } = tracker(1);
+    t.countFailure('a@example.fr');
+    t.countFailure('b@example.fr');
+    expect(t.size).toBe(1);
+  });
+
   it('sweeps closed windows as it goes', () => {
     const { clock, t } = tracker();
     for (let i = 0; i < 200; i++) t.countFailure(`old-${i}@example.fr`);
