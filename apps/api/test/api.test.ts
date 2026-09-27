@@ -213,6 +213,26 @@ describe('auth', () => {
     }
   });
 
+  it('two concurrent creations of one email: one 201, one 409, never a 500', async () => {
+    const email = 'role-twice@example.fr';
+    const create = () =>
+      app.inject({
+        method: 'POST',
+        url: '/api/v1/admins',
+        cookies: cookiesObject(cookies),
+        payload: { email, displayName: 'Doublon', password: 'role-account-12' },
+      });
+    try {
+      // Both pass the early existence check while their hashes run; the one inside the transaction
+      // turns the second insert into the 409 instead of a unique-constraint 500.
+      const codes = (await Promise.all([create(), create()])).map((r) => r.statusCode).sort();
+      expect(codes).toEqual([201, 409]);
+      expect(await app.prisma.admin.count({ where: { email } })).toBe(1);
+    } finally {
+      await app.prisma.admin.deleteMany({ where: { email } });
+    }
+  });
+
   it('wrong password → 401 with uniform message', async () => {
     const res = await app.inject({
       method: 'POST',

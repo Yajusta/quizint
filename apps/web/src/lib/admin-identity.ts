@@ -8,12 +8,13 @@ import { useEffect, useState } from 'react';
 
 import { z } from 'zod';
 
-import { AccountRole } from '@quiz/shared';
+import { AdminDTO } from '@quiz/shared';
 
 import { apiJson, ApiErrorThrown } from './api-client.ts';
 
+// The fields of the shared `AdminDTO` this module reads, `id` kept lenient (no uuid check).
 const MeSchema = z.object({
-  admin: z.object({ id: z.string(), displayName: z.string(), role: AccountRole }),
+  admin: AdminDTO.pick({ displayName: true, role: true }).extend({ id: z.string() }),
 });
 
 export type Me = z.infer<typeof MeSchema>['admin'];
@@ -55,7 +56,12 @@ export function useMe(): Me | null | undefined {
       if (alive) setMe(next);
     };
     listeners.add(update);
-    void fetchIdentity().then(update);
+    // Dropped if `primeMe` replaced the memo while this request ran: its identity is the fresher one,
+    // already handed to `update`.
+    const request = fetchIdentity();
+    void request.then((next) => {
+      if (mePromise === request || mePromise === null) update(next);
+    });
     return () => {
       alive = false;
       listeners.delete(update);

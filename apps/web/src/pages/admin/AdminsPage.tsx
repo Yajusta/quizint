@@ -9,7 +9,7 @@ import { useNavigate } from 'react-router';
 
 import { z } from 'zod';
 
-import { AccountRole, ADMIN_PASSWORD_MIN_LENGTH as PASSWORD_MIN, type AdminDTO } from '@quiz/shared';
+import { AccountRole, ADMIN_PASSWORD_MIN_LENGTH as PASSWORD_MIN, AdminDTO } from '@quiz/shared';
 
 import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { NBSP } from '../../lib/format.ts';
@@ -17,22 +17,13 @@ import { Badge, Button, Card, Dialog, Field, Input, Select } from '../../design-
 import { ListSkeleton } from '../../components/Skeletons.tsx';
 import { fetchFreshMe, primeMe, redirectIfUnauthorized, type Me } from '../../lib/admin-identity.ts';
 import { AdminLayout, ErrorAlert, Num, PageHeader, riseStyle, ROW } from './AdminLayout.tsx';
-import { accountErrorCode, accountRowActions } from './accounts.ts';
+import { accountErrorCode } from './accounts.ts';
 
+// The shared `AdminDTO`, made lenient on purpose (no uuid/email/int format check).
 const AdminsSchema = z.object({
-  admins: z.array(
-    z.object({
-      id: z.string(),
-      email: z.string(),
-      displayName: z.string(),
-      role: AccountRole,
-      isActive: z.boolean(),
-      createdAt: z.number(),
-    }),
-  ),
+  admins: z.array(AdminDTO.extend({ id: z.string(), email: z.string(), createdAt: z.number() })),
 });
 
-// Lenient parser on purpose (no uuid/email format check); the shape is the shared `AdminDTO`.
 type Admin = AdminDTO;
 
 const IdSchema = z.object({ admin: z.object({ id: z.string() }) });
@@ -89,10 +80,14 @@ export function AdminsPage() {
   const closeRole = useCallback(() => setRoleTarget(null), []);
   const closeReset = useCallback(() => setResetTarget(null), []);
 
-  /** Message for a failed call: translated for the known refusals, else the server's own text. */
+  /**
+   * Message for a failed call: translated for the known refusals, else the server's own text.
+   * FORBIDDEN keeps the server's text: its translation says the ADMIN role was lost, which only
+   * `fail` can tell apart from a CSRF refusal (same code), after asking the server.
+   */
   const describe = (e: unknown, fallbackKey: string): string => {
     const code = accountErrorCode(e);
-    if (code) return t(`accounts.apiErrors.${code}`);
+    if (code && code !== 'FORBIDDEN') return t(`accounts.apiErrors.${code}`);
     return e instanceof ApiErrorThrown ? e.message : t(fallbackKey);
   };
 
@@ -113,22 +108,28 @@ export function AdminsPage() {
   };
 
   /**
-   * Common failure path of the management calls: 401 → login; 403 → this account lost the ADMIN
-   * role meanwhile, so every management dialog closes and the page falls back to the own-password
-   * view; anything else goes to `show`.
+   * Common failure path of the management calls: 401 → login; 403 → the role is read again, since
+   * `requireAdmin` and the CSRF guard answer the same FORBIDDEN code: an account that lost the ADMIN
+   * role meanwhile gets every management dialog closed and the own-password view, one that is still
+   * an ADMIN gets the refusal in `show` like any other error.
    */
   const fail = (e: unknown, show: (message: string) => void, fallbackKey: string) => {
     if (redirectIfUnauthorized(e, navigate)) return;
-    if (accountErrorCode(e) === 'FORBIDDEN') {
+    if (accountErrorCode(e) !== 'FORBIDDEN') {
+      show(describe(e, fallbackKey));
+      return;
+    }
+    void refreshIdentity().then((fresh) => {
+      if (fresh?.role === 'ADMIN') {
+        show(describe(e, fallbackKey));
+        return;
+      }
       setPending(null);
       setRoleTarget(null);
       setResetTarget(null);
       setAdmins([]);
-      setError(t('accounts.apiErrors.FORBIDDEN'));
-      void refreshIdentity();
-      return;
-    }
-    show(describe(e, fallbackKey));
+      if (fresh) setError(t('accounts.apiErrors.FORBIDDEN'));
+    });
   };
 
   const loadAdmins = async () => {
@@ -150,8 +151,11 @@ export function AdminsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // The submit handlers return early while their request runs: a `loading` Button only drops its
+  // `onClick`, so Enter or a second click would still submit the form again.
   const create = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (creating) return;
     setCreateError(null);
     setCreateNotice(null);
     // The primary stays active at rest (lot 1 rule): validate on submit and explain what is
@@ -221,7 +225,7 @@ export function AdminsPage() {
 
   const resetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!resetTarget) return;
+    if (!resetTarget || resetting) return;
     setResetError(null);
     if (resetValue.length < PASSWORD_MIN) {
       setResetError(t('accounts.passwordTooShort', { count: PASSWORD_MIN }));
@@ -242,6 +246,7 @@ export function AdminsPage() {
 
   const changePassword = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (changing) return;
     setPasswordError(null);
     setPasswordNotice(null);
     if (!currentPassword) {
@@ -259,6 +264,8 @@ export function AdminsPage() {
       setCurrentPassword('');
       setNewPassword('');
     } catch (err) {
+      // A wrong current password is a 401 too, but a final one: only an expired session goes to login.
+      if (accountErrorCode(err) !== 'INVALID_CREDENTIALS' && redirectIfUnauthorized(err, navigate)) return;
       setPasswordError(describe(err, 'errors.update'));
     } finally {
       setChanging(false);
@@ -282,6 +289,7 @@ export function AdminsPage() {
   }
 
   const demoting = roleTarget?.role === 'ADMIN';
+  const roleTitle = demoting ? t('accounts.demoteTitle') : t('accounts.promoteTitle');
 
   return (
     <AdminLayout>
@@ -302,7 +310,10 @@ export function AdminsPage() {
           style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}
         >
           {admins.map((a, i) => {
-            const actions = accountRowActions(a, me.id);
+            // No action on the own row: the password goes through « Changer mon mot de passe » (the
+            // reset route refuses self), the server refuses a self-deactivation, and a self-demotion
+            // would lock the viewer out of this very page in one click.
+            const own = a.id === me.id;
             return (
               <Card key={a.id} padding="sm" style={riseStyle(i)}>
                 <div style={ROW}>
@@ -316,28 +327,26 @@ export function AdminsPage() {
                     <Badge tone={a.role === 'ADMIN' ? 'brand' : 'neutral'}>
                       {t(`accounts.role.${a.role}`)}
                     </Badge>
-                    {a.id === me.id && <Badge tone="neutral">{t('accounts.you')}</Badge>}
+                    {own && <Badge tone="neutral">{t('accounts.you')}</Badge>}
                     {!a.isActive && <Badge tone="danger">{t('accounts.disabled')}</Badge>}
                   </div>
                   <div style={{ display: 'flex', gap: 'var(--space-3)', flexWrap: 'wrap' }}>
-                    {actions.changeRole && (
-                      <Button size="sm" variant="ghost" onClick={() => setRoleTarget(a)}>
-                        {a.role === 'ADMIN' ? t('accounts.makeUser') : t('accounts.makeAdmin')}
-                      </Button>
-                    )}
-                    {actions.resetPassword && (
-                      <Button size="sm" variant="ghost" onClick={() => openReset(a)}>
-                        {t('accounts.resetPassword')}
-                      </Button>
-                    )}
-                    {actions.toggleActive && (
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => (a.isActive ? setPending(a) : void toggleActive(a))}
-                      >
-                        {a.isActive ? t('accounts.disable') : t('accounts.enable')}
-                      </Button>
+                    {!own && (
+                      <>
+                        <Button size="sm" variant="ghost" onClick={() => setRoleTarget(a)}>
+                          {a.role === 'ADMIN' ? t('accounts.makeUser') : t('accounts.makeAdmin')}
+                        </Button>
+                        <Button size="sm" variant="ghost" onClick={() => openReset(a)}>
+                          {t('accounts.resetPassword')}
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => (a.isActive ? setPending(a) : void toggleActive(a))}
+                        >
+                          {a.isActive ? t('accounts.disable') : t('accounts.enable')}
+                        </Button>
+                      </>
                     )}
                   </div>
                 </div>
@@ -450,6 +459,8 @@ export function AdminsPage() {
       <Dialog
         open={pending !== null}
         title={t('accounts.disableTitle')}
+        // The kit's `Dialog` does not tie its heading to `role="dialog"`: name it here.
+        aria-label={t('accounts.disableTitle')}
         description={pending ? t('accounts.disableDescription', { name: pending.displayName }) : undefined}
         onClose={closeDisable}
         footer={
@@ -466,7 +477,8 @@ export function AdminsPage() {
 
       <Dialog
         open={roleTarget !== null}
-        title={demoting ? t('accounts.demoteTitle') : t('accounts.promoteTitle')}
+        title={roleTitle}
+        aria-label={roleTitle}
         description={
           roleTarget
             ? t(demoting ? 'accounts.demoteDescription' : 'accounts.promoteDescription', {
@@ -494,6 +506,7 @@ export function AdminsPage() {
       <Dialog
         open={resetTarget !== null}
         title={t('accounts.resetTitle')}
+        aria-label={t('accounts.resetTitle')}
         description={
           resetTarget ? t('accounts.resetDescription', { name: resetTarget.displayName }) : undefined
         }

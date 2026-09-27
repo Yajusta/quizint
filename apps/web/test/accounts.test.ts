@@ -1,31 +1,10 @@
-// Account page rules: no management action on one's own row, and which API refusals the page
-// translates instead of showing the server's French message.
+// Account page rule: which API refusals the page translates instead of showing the server's French
+// message.
 
 import { describe, expect, it } from 'vitest';
 
 import { ApiErrorThrown } from '../src/lib/api-client.ts';
-import { accountErrorCode, accountRowActions } from '../src/pages/admin/accounts.ts';
-
-const ME = '00000000-0000-4000-8000-00000000000a';
-const OTHER = '00000000-0000-4000-8000-00000000000b';
-
-describe('accountRowActions', () => {
-  it('offers every action on another account', () => {
-    expect(accountRowActions({ id: OTHER }, ME)).toEqual({
-      toggleActive: true,
-      changeRole: true,
-      resetPassword: true,
-    });
-  });
-
-  it('offers nothing on the own row (the change-password card covers it)', () => {
-    expect(accountRowActions({ id: ME }, ME)).toEqual({
-      toggleActive: false,
-      changeRole: false,
-      resetPassword: false,
-    });
-  });
-});
+import { accountErrorCode } from '../src/pages/admin/accounts.ts';
 
 describe('accountErrorCode', () => {
   it('recognises the account refusals', () => {

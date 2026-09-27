@@ -190,16 +190,20 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (!parsed.success) {
       return reply.status(400).send(validationError(parsed.error));
     }
-    const existing = await app.prisma.admin.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
+    const email = parsed.data.email.toLowerCase();
+    const existing = await app.prisma.admin.findUnique({ where: { email } });
     if (existing) return reply.status(409).send(apiError('VALIDATION'));
     const passwordHash = await hashPassword(parsed.data.password);
-    // The caller's role is checked again next to the write: the argon2 run above leaves room for a
-    // demotion committed since requireAdmin, and a demoted account must not mint an ADMIN.
+    // The caller's role and the email are checked again next to the write: the argon2 run above
+    // leaves room for a demotion committed since requireAdmin (a demoted account must not mint an
+    // ADMIN), and for a concurrent creation of the same email, which would otherwise surface as a
+    // unique-constraint 500 instead of this 409.
     const admin = await app.prisma.$transaction(async (tx) => {
       if (!(await isActiveAdmin(tx, req.adminId))) return 'FORBIDDEN' as const;
+      if (await tx.admin.findUnique({ where: { email }, select: { id: true } })) return 'EXISTS' as const;
       return tx.admin.create({
         data: {
-          email: parsed.data.email.toLowerCase(),
+          email,
           displayName: parsed.data.displayName,
           role: parsed.data.role,
           passwordHash,
@@ -207,6 +211,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       });
     }, REQUEST_TX_OPTIONS);
     if (admin === 'FORBIDDEN') return reply.status(403).send(apiError('FORBIDDEN'));
+    if (admin === 'EXISTS') return reply.status(409).send(apiError('VALIDATION'));
     return reply.status(201).send({ admin: toAdminDTO(admin) });
   });
 
