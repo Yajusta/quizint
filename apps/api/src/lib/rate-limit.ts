@@ -2,8 +2,8 @@
 // store (the socket guards key on the same shared rateLimitKey). The rules themselves live in @quiz/shared (rate-limit.ts).
 
 import type { FastifyInstance, FastifyRequest, onRequestAsyncHookHandler } from 'fastify';
-// Type-only: the `createRateLimit` decorator's declaration.
-import type {} from '@fastify/rate-limit';
+// Type-only: the `createRateLimit` decorator's declaration comes with it.
+import type { RateLimitOptions } from '@fastify/rate-limit';
 
 import {
   LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX,
@@ -69,6 +69,25 @@ export function globalAddressLimit(app: FastifyInstance): onRequestAsyncHookHand
     throw new RateLimitedError(res.ttlInSeconds);
   };
 }
+
+/**
+ * A route's `config.rateLimit` counting `max` requests per minute per verified admin. It runs as a
+ * preHandler, appended to the route's preHandler array after authenticate: the key is the admin that
+ * authenticate verified in full, never an unverified claim, so a stolen cookie gets the same budget
+ * from any IP, and a request without a valid token stops at authenticate's 401 without touching the
+ * store (it cannot evict an admin's bucket from the LRU, and an expired token still gets the 401 the
+ * client refreshes on, not a 429). Being a route-level config, it replaces the global per-address
+ * limiter on that route: pair it with `globalAddressLimit` on onRequest. Each route-level config gets
+ * its own store already (no budget is shared across routes); `scope` only prefixes the key. Since the
+ * hook is pushed onto the route's preHandler array, that array must be the route's own, never one
+ * shared with other routes.
+ */
+export const perAdminLimit = (scope: string, max: number): RateLimitOptions => ({
+  hook: 'preHandler',
+  max,
+  timeWindow: '1 minute',
+  keyGenerator: (req: FastifyRequest) => `${scope}:${req.adminId}`,
+});
 
 /** A started password check, handed back to `fail` or `release`: bound to the run it was counted in. */
 export interface LoginAttempt {

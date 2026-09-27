@@ -8,6 +8,7 @@ export const ERROR_CODES = [
   'PASSWORD_TOO_SHORT',
   'CANNOT_DEACTIVATE_SELF',
   'LAST_ADMIN',
+  'CANNOT_RESET_OWN_PASSWORD',
   // Quiz
   'NOT_FOUND',
   'QUIZ_LOCKED',
@@ -55,6 +56,7 @@ export const ERROR_MESSAGES_FR: Record<ErrorCode, string> = {
   PASSWORD_TOO_SHORT: 'Le mot de passe doit contenir au moins 12 caractères',
   CANNOT_DEACTIVATE_SELF: 'Vous ne pouvez pas désactiver votre propre compte',
   LAST_ADMIN: 'Il doit rester au moins un administrateur actif',
+  CANNOT_RESET_OWN_PASSWORD: 'Utilisez le changement de mot de passe pour votre propre compte',
   NOT_FOUND: 'Ressource introuvable',
   QUIZ_LOCKED: 'Ce quiz a déjà été joué : dupliquez-le pour le modifier librement',
   VALIDATION: 'Données invalides',

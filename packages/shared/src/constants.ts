@@ -64,8 +64,13 @@ export const ADMIN_PASSWORD_MAX_LENGTH = 256;
 // (and turn a temporary theft into a takeover) by rotating IPs.
 export const LOGIN_ATTEMPTS_PER_MINUTE = 10;
 export const CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE = 5;
+// Password resets (POST /admins/:id/password) per minute, keyed on the ADMIN of a verified access JWT.
+// No secret is guessed there — the caller proves no password — so this is no guessing budget: it bounds
+// the Argon2 work (one hash per reset) and the session sweeps one account can trigger.
+export const ADMIN_PASSWORD_RESETS_PER_MINUTE = 10;
 // The global REST bucket, per client address, of every /api route without a limit of its own (a
-// route-level limit replaces it; change-password draws on it explicitly as well, see its route).
+// route-level limit replaces it; change-password and the password reset draw on it explicitly as
+// well, see their routes).
 export const API_REQUESTS_PER_MINUTE = 2000;
 /**
  * HS256 signing secret of the admin JWTs (`JWT_SECRET`, checked by apps/api/src/config.ts). Length

@@ -10,6 +10,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
+  ADMIN_PASSWORD_RESETS_PER_MINUTE,
   API_REQUESTS_PER_MINUTE,
   ARGON2_MAX_CONCURRENCY,
   ARGON2_MAX_QUEUE,
@@ -1148,6 +1149,132 @@ describe('account roles', () => {
     ]).toContainEqual({ status: loser.statusCode, code: loser.json().error.code });
     expect(await activeAdminCount()).toBe(1);
   });
+
+  describe('password reset', () => {
+    const newPassword = 'reset-by-an-admin-12';
+    const resetPassword = (
+      c: Record<string, string>,
+      id: string,
+      payload: Record<string, unknown> = { password: newPassword },
+    ) => app.inject({ method: 'POST', url: `/api/v1/admins/${id}/password`, cookies: c, payload });
+    const credentialsOf = (id: string) =>
+      app.prisma.admin.findUniqueOrThrow({
+        where: { id },
+        select: { passwordHash: true, passwordChangedAt: true, role: true, isActive: true },
+      });
+
+    it('a USER is refused with 403, and nothing changes', async () => {
+      const user = await account('role-reset-user@example.fr', 'USER');
+      const target = await account('role-reset-user-target@example.fr', 'USER');
+      const before = await credentialsOf(target.id);
+      // More attempts than the per-admin budget: all refused by requireAdmin, before the limiter.
+      for (let i = 0; i <= ADMIN_PASSWORD_RESETS_PER_MINUTE; i++) {
+        const res = await resetPassword(user.cookies, target.id);
+        expect(res.statusCode).toBe(403);
+        expect(res.json().error.code).toBe('FORBIDDEN');
+      }
+      const onAdmin = await resetPassword(user.cookies, await selfId());
+      expect(onAdmin.statusCode).toBe(403);
+      expect(await credentialsOf(target.id)).toEqual(before);
+      expect((await login('role-reset-user-target@example.fr', target.password)).statusCode).toBe(200);
+    });
+
+    it('an ADMIN resets a USER’s password: the old one and every earlier session are dead', async () => {
+      const email = 'role-reset-target@example.fr';
+      const user = await account(email, 'USER');
+      const res = await resetPassword(suite(), user.id);
+      expect(res.statusCode).toBe(204);
+      // Old password refused, new one accepted; role and status untouched.
+      const old = await login(email, user.password);
+      expect(old.statusCode).toBe(401);
+      expect(old.json().error.code).toBe('INVALID_CREDENTIALS');
+      expect((await login(email, newPassword)).statusCode).toBe(200);
+      expect(await credentialsOf(user.id)).toMatchObject({ role: 'USER', isActive: true });
+      // The target's access JWT and refresh cookie from before the reset are refused.
+      const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: user.cookies });
+      expect(me.statusCode).toBe(401);
+      const refresh = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/refresh',
+        cookies: user.cookies,
+      });
+      expect(refresh.statusCode).toBe(401);
+      // The resetting ADMIN is still signed in.
+      expect((await listAdmins(suite())).statusCode).toBe(200);
+    });
+
+    it('a reset lifts the target’s login delay: the new password signs in at once', async () => {
+      const email = 'role-reset-delayed@example.fr';
+      const user = await account(email, 'USER');
+      // Past the free failures: the account is delayed, even the right password gets a 429.
+      for (let i = 0; i <= LOGIN_FREE_FAILURES; i++) {
+        expect((await login(email, 'a-wrong-guess-123')).statusCode).toBe(401);
+      }
+      expect((await login(email, user.password)).statusCode).toBe(429);
+      expect((await resetPassword(suite(), user.id)).statusCode).toBe(204);
+      expect((await login(email, newPassword)).statusCode).toBe(200);
+    });
+
+    it('an ADMIN resets another ADMIN, and an inactive account (which stays inactive)', async () => {
+      const email = 'role-reset-admin@example.fr';
+      const other = await account(email, 'ADMIN');
+      expect((await resetPassword(suite(), other.id)).statusCode).toBe(204);
+      expect((await listAdmins(other.cookies)).statusCode).toBe(401);
+      expect((await login(email, newPassword)).statusCode).toBe(200);
+
+      expect((await patchAdmin(suite(), other.id, { isActive: false })).statusCode).toBe(200);
+      const second = 'reset-while-inactive-12';
+      expect((await resetPassword(suite(), other.id, { password: second })).statusCode).toBe(204);
+      expect(await credentialsOf(other.id)).toMatchObject({ role: 'ADMIN', isActive: false });
+      expect((await login(email, second)).statusCode).toBe(401);
+      // Reactivated: the password set while inactive is the one that signs in.
+      expect((await patchAdmin(suite(), other.id, { isActive: true })).statusCode).toBe(200);
+      expect((await login(email, second)).statusCode).toBe(200);
+    });
+
+    it('refuses its own account (409), an unknown account (404) and an invalid body (400)', async () => {
+      // A dedicated ADMIN: these refusals draw on the caller's reset budget.
+      const admin = await account('role-reset-refusals@example.fr', 'ADMIN');
+      const target = await account('role-reset-refusals-target@example.fr', 'USER');
+      const adminBefore = await credentialsOf(admin.id);
+      const targetBefore = await credentialsOf(target.id);
+
+      const self = await resetPassword(admin.cookies, admin.id);
+      expect(self.statusCode).toBe(409);
+      expect(self.json().error.code).toBe('CANNOT_RESET_OWN_PASSWORD');
+      // Nothing revoked: the caller is still signed in.
+      expect((await listAdmins(admin.cookies)).statusCode).toBe(200);
+
+      for (const id of [randomUUID(), 'nope']) {
+        const unknown = await resetPassword(admin.cookies, id);
+        expect(unknown.statusCode).toBe(404);
+        expect(unknown.json().error.code).toBe('NOT_FOUND');
+      }
+
+      for (const payload of [{}, { password: 'short' }, { password: newPassword, role: 'ADMIN' }]) {
+        const invalid = await resetPassword(admin.cookies, target.id, payload);
+        expect(invalid.statusCode).toBe(400);
+        expect(invalid.json().error.code).toBe('VALIDATION');
+      }
+      expect(await credentialsOf(admin.id)).toEqual(adminBefore);
+      expect(await credentialsOf(target.id)).toEqual(targetBefore);
+    });
+
+    it('the reset budget is per ADMIN and leaves the other account routes alone', async () => {
+      const admin = await account('role-reset-budget@example.fr', 'ADMIN');
+      for (let i = 0; i < ADMIN_PASSWORD_RESETS_PER_MINUTE; i++) {
+        expect((await resetPassword(admin.cookies, randomUUID())).statusCode).toBe(404);
+      }
+      const blocked = await resetPassword(admin.cookies, randomUUID());
+      expect(blocked.statusCode).toBe(429);
+      expect(blocked.json().error.code).toBe('RATE_LIMITED');
+      // The other ADMIN-only routes keep their own limits (the limiter hook is not on `adminOnly`).
+      expect((await listAdmins(admin.cookies)).statusCode).toBe(200);
+      expect((await patchAdmin(admin.cookies, admin.id, { displayName: 'Budget' })).statusCode).toBe(200);
+      // Another ADMIN's budget is untouched.
+      expect((await resetPassword(suite(), randomUUID())).statusCode).toBe(404);
+    });
+  });
 });
 
 describe('auth hardening', () => {
@@ -1169,7 +1296,7 @@ describe('auth hardening', () => {
     return `${input}.${sig}`;
   };
 
-  it('PATCH /admins/:id refuses a password: nobody resets a colleague’s password', async () => {
+  it('PATCH /admins/:id refuses a password: resets go through POST /admins/:id/password only', async () => {
     const self = (await me(cookiesObject(cookies))).json().admin.id as string;
     const res = await app.inject({
       method: 'PATCH',
@@ -1202,6 +1329,13 @@ describe('auth hardening', () => {
       payload: { currentPassword: TEST_PASSWORD, newPassword: long },
     });
     expect(change.statusCode).toBe(400);
+    const reset = await app.inject({
+      method: 'POST',
+      url: `/api/v1/admins/${randomUUID()}/password`,
+      cookies: cookiesObject(cookies),
+      payload: { password: long },
+    });
+    expect(reset.statusCode).toBe(400);
   });
 
   it('an access JWT with another algorithm, issuer or audience is refused', async () => {
@@ -3518,6 +3652,31 @@ describe('live engine', () => {
       } finally {
         spy.mockRestore();
         await manager.endSession(s);
+      }
+    });
+
+    it('an ADMIN resetting an account’s password drops that account’s presenter sockets', async () => {
+      const { admin, theirs, sessionId, s } = await revocableAdmin('203.0.113.80');
+      try {
+        const stage = await connectedStage(sessionId, theirs);
+        const reset = await app.inject({
+          method: 'POST',
+          url: `/api/v1/admins/${admin.id}/password`,
+          cookies: cookiesObject(cookies),
+          payload: { password: 'reset-by-an-admin-12' },
+        });
+        expect(reset.statusCode).toBe(204);
+        expect(await stage.disconnected).toBe('io server disconnect');
+        await vi.waitFor(() => expect(presenterSocketsOf(admin.id)).toEqual([]));
+        // And the next handshake with the same cookie is refused.
+        expect(await handshake('/presenter', { auth: { sessionId }, cookie: theirs })).toBe('UNAUTHORIZED');
+      } finally {
+        await app.sessionManager.endSession(s);
+        // revocableAdmin signs in with TEST_PASSWORD: put it back for the other tests.
+        await app.prisma.admin.update({
+          where: { id: admin.id },
+          data: { passwordHash: await hash(TEST_PASSWORD) },
+        });
       }
     });
 

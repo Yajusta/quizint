@@ -1,10 +1,12 @@
 // Auth routes (§5.1): login, refresh, logout, me, admin management, change-password.
 
 import type { Prisma } from '@prisma/client';
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance } from 'fastify';
 
 import {
+  ADMIN_PASSWORD_RESETS_PER_MINUTE,
   AdminCreateInput,
+  AdminPasswordResetInput,
   AdminPatchInput,
   CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
   ChangePasswordInput,
@@ -23,7 +25,7 @@ import {
   validationError,
 } from '../../lib/api.js';
 import { hashPassword, verifyPassword, verifyThenHash } from '../../lib/password.js';
-import { LoginThrottleTracker, globalAddressLimit } from '../../lib/rate-limit.js';
+import { LoginThrottleTracker, globalAddressLimit, perAdminLimit } from '../../lib/rate-limit.js';
 import { nextCredentialVersion } from '../../plugins/auth.js';
 import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
 
@@ -170,18 +172,20 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   // Account management is ADMIN-only. requireAdmin reads the role authenticate loaded on this very
   // request, so a demoted account loses these routes from its next request, with the same access
-  // token; the writes (POST, PATCH) check it once more inside their transaction (isActiveAdmin), so a
-  // request already in flight when the demotion commits writes nothing either.
-  const adminOnly = [app.authenticate, app.requireAdmin];
+  // token; the writes (POST, PATCH, password reset) check it once more inside their transaction
+  // (isActiveAdmin), so a request already in flight when the demotion commits writes nothing either.
+  // A fresh array per route: @fastify/rate-limit pushes a route-level limiter onto the route's own
+  // preHandler array, so one shared array would carry that limit onto every other account route.
+  const adminOnly = () => [app.authenticate, app.requireAdmin];
 
   // --- GET /api/v1/admins ---------------------------------------------------
-  app.get('/admins', { preHandler: adminOnly }, async () => {
+  app.get('/admins', { preHandler: adminOnly() }, async () => {
     const admins = await app.prisma.admin.findMany({ orderBy: { createdAt: 'asc' } });
     return { admins: admins.map(toAdminDTO) };
   });
 
   // --- POST /api/v1/admins --------------------------------------------------
-  app.post('/admins', { preHandler: adminOnly }, async (req, reply) => {
+  app.post('/admins', { preHandler: adminOnly() }, async (req, reply) => {
     const parsed = AdminCreateInput.safeParse(req.body);
     if (!parsed.success) {
       return reply.status(400).send(validationError(parsed.error));
@@ -207,7 +211,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   });
 
   // --- PATCH /api/v1/admins/:id --------------------------------------------
-  app.patch<{ Params: { id: string } }>('/admins/:id', { preHandler: adminOnly }, async (req, reply) => {
+  app.patch<{ Params: { id: string } }>('/admins/:id', { preHandler: adminOnly() }, async (req, reply) => {
     const parsed = AdminPatchInput.safeParse(req.body);
     if (!parsed.success) {
       return reply.status(400).send(validationError(parsed.error));
@@ -262,35 +266,82 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     if (admin === 'NOT_FOUND') return reply.status(404).send(apiError('NOT_FOUND'));
     if (admin === 'LAST_ADMIN') return reply.status(409).send(apiError('LAST_ADMIN'));
     // A deactivation ends the account's sessions, whoever holds them. There is no password field
-    // here (AdminPatchInput is strict): nobody resets a colleague's password.
+    // here (AdminPatchInput is strict): an ADMIN resets another account's password through
+    // POST /admins/:id/password, and an account changes its own through /auth/change-password.
     if (deactivating) {
       await app.revokeAdminSessions(admin.id);
     }
     return { admin: toAdminDTO(admin) };
   });
 
+  // --- POST /api/v1/admins/:id/password -------------------------------------
+  // An ADMIN sets another account's password, whatever its role or status (an inactive account stays
+  // inactive), without knowing the current one. Its own password goes through /auth/change-password,
+  // which asks for the current one, so this route never lets a session replace its own account's
+  // password without it. That is no step-up: an ADMIN session can already create a second ADMIN and
+  // reset from there, as it can do anything else an ADMIN can.
+  // Limits as on change-password (perAdminLimit, after requireAdmin: a USER is refused 403 before
+  // touching the store).
+  app.post<{ Params: { id: string } }>(
+    '/admins/:id/password',
+    {
+      onRequest: globalAddressLimit(app),
+      preHandler: adminOnly(),
+      config: { rateLimit: perAdminLimit('admin-reset', ADMIN_PASSWORD_RESETS_PER_MINUTE) },
+    },
+    async (req, reply) => {
+      const parsed = AdminPasswordResetInput.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.status(400).send(validationError(parsed.error));
+      }
+      const targetId = req.params.id;
+      if (targetId === req.adminId) {
+        return reply.status(409).send(apiError('CANNOT_RESET_OWN_PASSWORD'));
+      }
+      const exists = await app.prisma.admin.findUnique({ where: { id: targetId }, select: { id: true } });
+      if (!exists) return reply.status(404).send(apiError('NOT_FOUND'));
+      // Hashed outside the transaction, through the Argon2 limiter (a saturated one answers 429 before
+      // anything is written): the single SQLite connection is not held during the hash.
+      const passwordHash = await hashPassword(parsed.data.password);
+      // One transaction: re-check the caller is still an active ADMIN (a demotion or a deactivation
+      // committed during the hash wins), re-read the target, then write the hash with a credential
+      // version moved strictly past the one read here, so every access JWT and refresh token issued
+      // before is refused — and still after a later reactivation.
+      const result = await app.prisma.$transaction(async (tx) => {
+        if (!(await isActiveAdmin(tx, req.adminId))) return 'FORBIDDEN' as const;
+        const current = await tx.admin.findUnique({
+          where: { id: targetId },
+          select: { email: true, passwordChangedAt: true },
+        });
+        if (!current) return 'NOT_FOUND' as const;
+        await tx.admin.update({
+          where: { id: targetId },
+          data: { passwordHash, passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) },
+        });
+        return { email: current.email };
+      }, REQUEST_TX_OPTIONS);
+      if (result === 'FORBIDDEN') return reply.status(403).send(apiError('FORBIDDEN'));
+      if (result === 'NOT_FOUND') return reply.status(404).send(apiError('NOT_FOUND'));
+      // The bump is committed: end every session of the target (refresh rows, presenter sockets).
+      await app.revokeAdminSessions(targetId);
+      // The account starts afresh at login, as after a successful one: failures typed against the old
+      // password must not delay the first sign-in with the new one.
+      loginThrottle.reset(result.email.toLowerCase());
+      return reply.status(204).send();
+    },
+  );
+
   // --- POST /api/v1/auth/change-password ------------------------------------
-  // The limit runs as a preHandler, after authenticate (appended to the route's preHandler array),
-  // not on onRequest: the key is the admin that authenticate verified in full, never an unverified
-  // claim. Keyed on the admin, a stolen cookie gets the same budget from any IP. A request without a
-  // valid token stops at authenticate's 401 and never touches the store: it cannot evict an admin's
-  // bucket from the LRU, and an expired token still gets the 401 the client refreshes on, not a 429.
-  // That route-level config replaces the global per-address limiter on this route, so the onRequest
-  // hook draws on the global bucket explicitly: requests refused by authenticate (no, forged or
-  // revoked token) stay capped per address like on any other route.
+  // Limited per admin (perAdminLimit, after authenticate) and per address: the route-level config
+  // replaces the global per-address limiter here, so the onRequest hook draws on the global bucket
+  // explicitly, and requests refused by authenticate (no, forged or revoked token) stay capped per
+  // address like on any other route.
   app.post(
     '/auth/change-password',
     {
       onRequest: globalAddressLimit(app),
       preHandler: app.authenticate,
-      config: {
-        rateLimit: {
-          hook: 'preHandler',
-          max: CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
-          timeWindow: '1 minute',
-          keyGenerator: (req: FastifyRequest) => `admin:${req.adminId}`,
-        },
-      },
+      config: { rateLimit: perAdminLimit('admin', CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE) },
     },
     async (req, reply) => {
       const parsed = ChangePasswordInput.safeParse(req.body);
