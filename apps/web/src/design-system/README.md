@@ -35,7 +35,8 @@ Le composant local rend `lucide-react` en imports nommés (tree-shaking).
 - Registre étendu au-delà du working set du skill : `library`, `history`, `bar-chart-3`, `pencil`,
   `search`, `download`, `rotate-ccw`, `list-plus`, `archive`, `circle-help`, `chevron-right`,
   `arrow-left`, `square`, `user`, `minus`, `wifi-off`, `log-out`, `inbox`, `lock`,
-  `grip-vertical`, `trophy`, `user-x`, `upload`, `copy`, `maximize`, `maximize-2`, `minimize`.
+  `grip-vertical`, `trophy`, `user-x`, `upload`, `copy`, `maximize`, `maximize-2`, `minimize`,
+  `monitor-smartphone`.
 - lucide-react 1.x a renommé certains exports : les slugs du skill sont conservés et pointent sur
   les noms canoniques (`bar-chart-3` → `ChartColumn`, `circle-help` → `CircleQuestionMark`,
   `history` → `RotateCcwClock`, `trash-2` → `Trash`).

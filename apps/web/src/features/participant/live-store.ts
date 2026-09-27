@@ -33,12 +33,20 @@ export interface ParticipantLiveState {
   final: ParticipantFinalView | null;
   clockOffset: number;
   kicked: boolean;
+  /**
+   * The seat was taken by a newer tab or device resuming the same token. Terminal until the viewer
+   * takes it back: the server ended this socket with a namespace disconnect, which socket.io-client
+   * never retries on its own.
+   */
+  replaced: boolean;
 }
 
 export interface ParticipantLiveActions {
   attach(socket: Socket): void;
   /** A resume refused with KICKED: the socket is gone, no `participant:kicked` event will come. */
   markKicked(): void;
+  /** A resume refused with SESSION_ENDED: no `session:ended` event will come either. */
+  markEnded(): void;
   reset(): void;
 }
 
@@ -55,6 +63,7 @@ const INITIAL: Omit<ParticipantLiveState, 'clockOffset'> = {
   roundResult: null,
   final: null,
   kicked: false,
+  replaced: false,
 };
 
 export const useParticipantLive = create<ParticipantLiveState & ParticipantLiveActions>((set) => ({
@@ -63,6 +72,10 @@ export const useParticipantLive = create<ParticipantLiveState & ParticipantLiveA
 
   markKicked() {
     set({ kicked: true, connected: false });
+  },
+
+  markEnded() {
+    set({ phase: 'ENDED', connected: false });
   },
 
   attach(socket) {
@@ -124,8 +137,17 @@ export const useParticipantLive = create<ParticipantLiveState & ParticipantLiveA
     socket.on('session:ended', () => set({ phase: 'ENDED', connected: false }));
     socket.on('lobby:count', (e: LobbyCountEvent) => set({ participantCount: e.count }));
     socket.on('participant:kicked', () => set({ kicked: true, connected: false }));
-    socket.on('participant:replaced', () => set({ connected: false }));
-    socket.on('disconnect', () => set({ connected: false }));
+    socket.on('participant:replaced', () => set({ replaced: true, connected: false }));
+    socket.on('disconnect', (reason: string) =>
+      set((prev) => ({
+        connected: false,
+        // A server-side namespace disconnect is never retried by the client. The API sends one only
+        // after `session:ended`, `participant:kicked` or `participant:replaced`; without either of
+        // the first two, this tab would otherwise wait on its reconnection banner forever.
+        replaced:
+          prev.replaced || (reason === 'io server disconnect' && prev.phase !== 'ENDED' && !prev.kicked),
+      })),
+    );
     socket.on('connect', () => set({ connected: true }));
   },
 

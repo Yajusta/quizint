@@ -2965,6 +2965,58 @@ describe('live engine', () => {
       await manager.endSession(s);
     });
 
+    it('releases the seat when the transport drops while the resume builds its snapshot', async () => {
+      const quiz = await createQuiz('Quiz coupure pendant la reprise', [mcq()]);
+      const { code, s } = await createLiveSession(quiz.id);
+      const first = await joinedPhone(code, 'Élio');
+      first.socket.close();
+      const participant = [...s.participants.values()][0]!;
+      await vi.waitFor(() => expect(participant.connected).toBe(false));
+
+      const manager = app.sessionManager;
+      const original = manager.participantSnapshot.bind(manager);
+      let entered!: () => void;
+      const inSnapshot = new Promise<void>((resolve) => (entered = resolve));
+      let finish!: () => void;
+      const release = new Promise<void>((resolve) => (finish = resolve));
+      const spy = vi.spyOn(manager, 'participantSnapshot').mockImplementationOnce(async (st, p) => {
+        entered();
+        await release;
+        return original(st, p);
+      });
+      const broadcast = vi.spyOn(
+        manager as unknown as { broadcastParticipantsList: (s: unknown) => void },
+        'broadcastParticipantsList',
+      );
+      const phone = ioClient(`${base}/participant`, {
+        transports: ['websocket'],
+        forceNew: true,
+        reconnection: false,
+        auth: { token: first.token },
+      });
+      opened.push(phone);
+      try {
+        await inSnapshot;
+        // Resumed: online with the handshaking socket's id, which never reaches `connection`.
+        expect(participant.connected).toBe(true);
+        broadcast.mockClear();
+        phone.close(); // the transport goes while the snapshot is still pending
+        await vi.waitFor(() => expect(participant.connected).toBe(false));
+        expect(participant.socketId).toBeNull();
+        expect(broadcast).toHaveBeenCalledTimes(1);
+        finish();
+        // The handshake then completes against a closed transport: nothing flips presence back.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(participant.connected).toBe(false);
+        expect(broadcast).toHaveBeenCalledTimes(1);
+      } finally {
+        finish();
+        spy.mockRestore();
+        broadcast.mockRestore();
+        await manager.endSession(s);
+      }
+    });
+
     it('refuses a malformed resume token', async () => {
       expect(await handshake('/participant', { auth: { token: { $ne: '' } } })).toBe('TOKEN_INVALID');
       expect(await handshake('/participant', { auth: { token: 'x'.repeat(4096) } })).toBe('TOKEN_INVALID');

@@ -23,6 +23,7 @@ export function useParticipantSocket(code: string) {
   const [resumePending, setResumePending] = useState(() => loadParticipant(code)?.token !== undefined);
   const attach = useParticipantLive((s) => s.attach);
   const markKicked = useParticipantLive((s) => s.markKicked);
+  const markEnded = useParticipantLive((s) => s.markEnded);
   const reset = useParticipantLive((s) => s.reset);
 
   const connect = useCallback(
@@ -40,7 +41,8 @@ export function useParticipantSocket(code: string) {
         const refusal = err.data?.code;
         if (!refusal) return;
         // The token this socket handshakes with: the stored one, or the one `join` set later.
-        const current = (socket.auth as { token?: string }).token;
+        // `auth` is undefined on a socket opened without one (anonymous, not joined yet).
+        const current = (socket.auth as { token?: string } | undefined)?.token;
         if (refusal === 'INTERNAL' || refusal === 'RATE_LIMITED') {
           // Transient (the snapshot failed) or a reconnect storm throttled by the API: the seat and
           // score are intact, so the token is kept and the handshake retried after a pause instead
@@ -60,28 +62,35 @@ export function useParticipantSocket(code: string) {
           return;
         }
         // TOKEN_INVALID, SESSION_ENDED, SESSION_NOT_FOUND: fall back to the nickname screen (the
-        // REST lookup tells the page whether the session is closed or gone).
+        // REST lookup tells the page whether the session is closed or gone). That lookup ran on
+        // mount: a seat taken back (`reclaim`) after the session ended must still end on its
+        // terminal screen, not on a nickname prompt for a closed room.
         clearParticipant(code);
         socket.close();
+        // Ended: the terminal screen needs no socket, an anonymous one would only hold an IP slot.
+        if (refusal === 'SESSION_ENDED') return markEnded();
         connect();
       });
       return socket;
     },
-    [attach, code, markKicked],
+    [attach, code, markKicked, markEnded],
   );
+
+  /** Drops the pending retry, the current socket and the live state. */
+  const teardown = useCallback(() => {
+    if (retryRef.current) clearTimeout(retryRef.current);
+    retryRef.current = null;
+    // The ref, not a closure: a refused resume replaced the socket with a fresh one.
+    socketRef.current?.close();
+    socketRef.current = null;
+    reset();
+  }, [reset]);
 
   useEffect(() => {
     const stored = loadParticipant(code);
     connect(stored?.token);
-    return () => {
-      if (retryRef.current) clearTimeout(retryRef.current);
-      retryRef.current = null;
-      // The ref, not the closure: a refused resume replaced the socket with a fresh one.
-      socketRef.current?.close();
-      socketRef.current = null;
-      reset();
-    };
-  }, [code, connect, reset]);
+    return teardown;
+  }, [code, connect, teardown]);
 
   const join = useCallback(
     (nickname: string) =>
@@ -115,6 +124,19 @@ export function useParticipantSocket(code: string) {
     [code],
   );
 
+  /**
+   * Takes the seat back on this tab after a `participant:replaced`: the same resume as a reload,
+   * which in turn replaces the other tab. User-driven only, so two tabs never ping-pong on their own.
+   */
+  const reclaim = useCallback(() => {
+    // This tab's own seat first: storage may hold a newer participant another tab joined as.
+    const token =
+      (socketRef.current?.auth as { token?: string } | undefined)?.token ?? loadParticipant(code)?.token;
+    teardown();
+    setResumePending(token !== undefined);
+    connect(token);
+  }, [code, connect, teardown]);
+
   const submitAnswer = useCallback(
     (questionIndex: number, answer: AnswerSubmission) =>
       new Promise<{ ok: boolean; code?: string }>((resolve) => {
@@ -134,5 +156,5 @@ export function useParticipantSocket(code: string) {
     [],
   );
 
-  return { join, joinErrorCode, submitAnswer, resumePending };
+  return { join, joinErrorCode, submitAnswer, resumePending, reclaim };
 }

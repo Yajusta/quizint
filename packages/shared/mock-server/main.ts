@@ -8,7 +8,7 @@
 //   POST /mock/sessions                — create a session { quiz?: 'demo' | 'showcase', ackDelayMs?: number }
 //   GET  /mock/sessions/:id            — session detail including the quiz snapshot (correct answers — mock only)
 //   POST /mock/sessions/:id/ack-delay  — { ms } delay answer acks (captures the "sélection en cours" state)
-//   POST /mock/sessions/:id/disconnect — server-side disconnect of every participant socket (reconnection banner)
+//   POST /mock/sessions/:id/disconnect — transport cut of every participant socket (reconnection banner)
 //   GET  /uploads/mock-sample.svg      — image used by the showcase fixture
 //   presenter command `participant:kick` and event `session:final` (both were missing);
 //   `question:open` / `question:closed` are now sent once per socket (the per-participant result was
@@ -22,6 +22,9 @@
 //   POST /mock/sessions { pointsScale } — multiplies every question's points (five-digit scores on the podium)
 //   POST /mock/sessions/:id/settings   — partial LiveSessionSettings, emits `settings:changed`
 //   POST /mock/sessions/:id/disconnect — accepts { namespace: 'participant' | 'presenter' } (default participant)
+//   POST /mock/sessions/:id/replace    — `participant:replaced` then a namespace disconnect to every participant
+//                                        socket, as the API does when another tab resumes the same token (the
+//                                        mock has no token resume of its own)
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
@@ -36,6 +39,7 @@ import {
   buildVisibleRanking,
   canTransition,
   correctAnswerFor,
+  errorMessage,
   GRACE_MS,
   INTERMEDIATE_RANKING_SIZE,
   isJoinable,
@@ -597,14 +601,32 @@ async function handleHttp(req: IncomingMessage, res: ServerResponse) {
       const body = await readJson(req);
       // Lot 2: { namespace: 'presenter' } cuts the stage sockets instead (reconnection banner on stage).
       const ns = body.namespace === 'presenter' ? presenterNs : participantNs;
+      // A participant cut is a transport close, as a network drop: a namespace disconnect is what
+      // the API sends a replaced tab, and the phone would show its terminal screen instead of the
+      // reconnection banner. Handshakes are refused RATE_LIMITED for a moment, so the banner stays
+      // up long enough to be captured before the phone's paced retry gets back in.
+      if (ns === participantNs) participantHoldUntil = Date.now() + 3000;
       let n = 0;
       for (const sock of ns.sockets.values()) {
         if (sock.data.sessionId === s.id) {
-          sock.disconnect(true);
+          if (ns === participantNs) sock.conn.close();
+          else sock.disconnect(true);
           n += 1;
         }
       }
       return json(res, 200, { ok: true, disconnected: n });
+    }
+    if (action === 'replace' && method === 'POST') {
+      let n = 0;
+      for (const sock of participantNs.sockets.values()) {
+        if (sock.data.sessionId === s.id) {
+          sock.emit('participant:replaced');
+          // Namespace disconnect, as SessionManager: the client does not reconnect on its own.
+          sock.disconnect();
+          n += 1;
+        }
+      }
+      return json(res, 200, { ok: true, replaced: n });
     }
     // Lot 2: live settings toggle from the e2e driver (a REST twin of the presenter command
     // `settings:update`) — needed to capture the closed screen with and without the top 5.
@@ -640,6 +662,15 @@ const io = new SocketIOServer(httpServer, {
 
 const participantNs = io.of('/participant');
 const presenterNs = io.of('/presenter');
+
+/** Until then, /participant handshakes are refused RATE_LIMITED: see the `disconnect` route. */
+let participantHoldUntil = 0;
+participantNs.use((_socket, next) => {
+  if (Date.now() < participantHoldUntil) {
+    return next(Object.assign(new Error(errorMessage('RATE_LIMITED')), { data: { code: 'RATE_LIMITED' } }));
+  }
+  next();
+});
 
 // Auto-create one session on boot so lots 5/6 can develop immediately.
 const bootSession = createSession();

@@ -142,14 +142,27 @@ export const livePlugin = fp(
         return refuse('INTERNAL');
       }
       if (!result.ok) return refuse(result.code, result.message);
+      // The resume marked them online with this socket id. A transport closed while the snapshot
+      // is built (or in the tick between `next()` and `connection`) makes socket.io drop the socket
+      // without any `disconnect`: roll presence back from the transport itself. `markDisconnected`
+      // is idempotent (socket id check), so the regular `disconnect` path may run it as well; the
+      // listener goes on disconnect, as the slot release does, since one engine.io connection can
+      // carry several successive /participant sockets.
+      const { s: resumed, participant } = result;
+      const dropPresence = () => {
+        socket.conn.off('close', dropPresence);
+        manager.markDisconnected(resumed, participant.id, socket.id);
+      };
+      socket.conn.once('close', dropPresence);
+      socket.once('disconnect', () => socket.conn.off('close', dropPresence));
       try {
-        socket.emit('state:snapshot', await manager.participantSnapshot(result.s, result.participant));
+        socket.emit('state:snapshot', await manager.participantSnapshot(resumed, participant));
         next();
       } catch (err) {
-        // The resume already marked them online with this socket id and a refused handshake fires
-        // no disconnect: roll presence back, or the panel would show them connected for good.
+        // A refused handshake fires no disconnect either: roll presence back, or the panel would
+        // show them connected for good.
         app.log.error({ err }, 'participant snapshot failed');
-        manager.markDisconnected(result.s, result.participant.id, socket.id);
+        dropPresence();
         refuse('INTERNAL');
       }
     });

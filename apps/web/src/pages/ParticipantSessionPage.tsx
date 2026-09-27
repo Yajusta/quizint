@@ -2,7 +2,7 @@
 // Rendering (plan § 5.1): light ground until registration, stage ground from the lobby to the
 // final ranking, light again on the terminal states. Screens live in ./participant/*.
 
-import { lazy, Suspense, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { useParams } from 'react-router';
 
 import { toLocalTime } from '../features/shared-live/clock.ts';
@@ -31,7 +31,7 @@ type JoinStatus = 'loading' | 'open' | 'closed' | 'notfound';
 
 export function ParticipantSessionPage() {
   const { code = '' } = useParams();
-  const { join, joinErrorCode, submitAnswer, resumePending } = useParticipantSocket(code);
+  const { join, joinErrorCode, submitAnswer, resumePending, reclaim } = useParticipantSocket(code);
   const live = useParticipantLive();
 
   const [joining, setJoining] = useState(false);
@@ -39,6 +39,13 @@ export function ParticipantSessionPage() {
 
   // Public join info (title, count) before the socket registers; 404/410 drive the terminal states.
   const [joinStatus, setJoinStatus] = useState<JoinStatus>('loading');
+  // Bumped by a reclaim: the room may have ended or been deleted while this tab sat on `replaced`,
+  // and a refused resume falls back on this lookup to pick its screen.
+  const [lookup, setLookup] = useState(0);
+  const onReclaim = useCallback(() => {
+    setLookup((n) => n + 1);
+    reclaim();
+  }, [reclaim]);
   useEffect(() => {
     let cancelled = false;
     setJoinStatus('loading');
@@ -71,7 +78,7 @@ export function ParticipantSessionPage() {
     return () => {
       cancelled = true;
     };
-  }, [code]);
+  }, [code, lookup]);
 
   // Prefetch on mount: both chunks are tiny and land long before the end of the quiz, so the
   // switch to the ranking or to a terminal screen stays instant.
@@ -89,9 +96,11 @@ export function ParticipantSessionPage() {
     ? 'kicked'
     : closedToNewcomer || live.phase === 'ENDED'
       ? 'ended'
-      : joinStatus === 'notfound'
-        ? 'notfound'
-        : null;
+      : live.replaced
+        ? 'replaced'
+        : joinStatus === 'notfound'
+          ? 'notfound'
+          : null;
 
   useThemeColor(registered && terminal === null ? 'stage' : 'light');
 
@@ -99,7 +108,7 @@ export function ParticipantSessionPage() {
   if (terminal)
     return (
       <Suspense fallback={<LightShell>{null}</LightShell>}>
-        <TerminalScreen kind={terminal} />
+        <TerminalScreen kind={terminal} onReclaim={onReclaim} />
       </Suspense>
     );
 

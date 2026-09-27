@@ -69,5 +69,9 @@ export default {
     endedDescription: 'Merci d’avoir participé.',
     kickedTitle: 'Vous avez été retiré de la session',
     kickedDescription: 'Le présentateur a fermé votre accès à cette salle.',
+    replacedTitle: 'Session ouverte sur un autre appareil',
+    replacedDescription:
+      'Votre place est passée sur un autre onglet ou appareil. Reprenez-la ici pour continuer sur celui-ci.',
+    reclaimAction: 'Continuer ici',
   },
 };

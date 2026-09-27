@@ -64,5 +64,8 @@ export default {
     endedDescription: 'Thanks for taking part.',
     kickedTitle: 'You were removed from the session',
     kickedDescription: 'The presenter closed your access to this room.',
+    replacedTitle: 'Session opened on another device',
+    replacedDescription: 'Your seat moved to another tab or device. Take it back to keep playing here.',
+    reclaimAction: 'Continue here',
   },
 };
