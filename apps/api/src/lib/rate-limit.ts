@@ -1,4 +1,4 @@
-// REST rate-limit wiring: the per-address key, the 429 envelope, and the per-account login failure
+// REST rate-limit wiring: the per-address key, the 429 envelope, and the per-account login delay
 // store (the socket guards key on the same shared rateLimitKey). The rules themselves live in @quiz/shared (rate-limit.ts).
 
 import type { FastifyInstance, FastifyRequest, onRequestAsyncHookHandler } from 'fastify';
@@ -7,12 +7,16 @@ import type {} from '@fastify/rate-limit';
 
 import {
   LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX,
-  countLoginFailure,
+  claimLoginAttempt,
   errorMessage,
-  isLoginFailureWindowOpen,
-  loginThrottledFor,
+  hasLoginThrottleLapsed,
+  isLoginDelayed,
+  loginRetryAfterMs,
   rateLimitKey,
-  type LoginFailureWindow,
+  releaseLoginAttempt,
+  retryAfterSeconds,
+  settleLoginFailure,
+  type LoginThrottleState,
 } from '@quiz/shared';
 
 import { sha256 } from './api.js';
@@ -66,97 +70,162 @@ export function globalAddressLimit(app: FastifyInstance): onRequestAsyncHookHand
   };
 }
 
+/** A started password check, handed back to `fail` or `release`: bound to the run it was counted in. */
+export interface LoginAttempt {
+  readonly key: string;
+  readonly run: number;
+  /** The write the claim made, and the `lastAt` it replaced: see `release`. */
+  readonly write: number;
+  readonly previousLastAt: number | undefined;
+}
+
+/** What `claim` answers: a check may start, or the account must wait `retryAfter` seconds. */
+export type LoginClaim =
+  { readonly ok: true; readonly attempt: LoginAttempt } | { readonly ok: false; readonly retryAfter: number };
+
+interface Tracked {
+  readonly state: LoginThrottleState;
+  /**
+   * Numbers from the tracker-wide write sequence. `run` is the write that opened this run (a verdict
+   * never lands in a run a success or a lapse replaced), `write` the one that left this state (tells
+   * whether anything touched it since a claim).
+   */
+  readonly run: number;
+  readonly write: number;
+}
+
+/** Lapsed entries dropped per write, at most per map: keeps each write O(1). */
+const SWEEP_BUDGET = 8;
+
 /**
- * Failed login attempts per account (in memory: a single API process, see CLAUDE.md). Keys are a hash
- * of the normalised email, so a key costs the same whatever the email's length. The map is bounded:
- * expired windows are swept now and then, and past LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX expired windows go first, then
- * the least recently counted entry that is not throttled (see evictOne).
+ * Per-account login delay store (in memory: a single API process, see CLAUDE.md), the rules being
+ * the shared ones (LoginThrottleState). Keys are a hash of the normalised email, so a key costs the
+ * same whatever the email's length.
+ *
+ * Bounded at `maxTracked` entries, every write a bounded number of map operations (no scan of the
+ * store: a few front reads, one eviction, a sweep of at most SWEEP_BUDGET entries per map — V8 does
+ * skip the deleted slots at a map's front on each of those reads, some tens of microseconds on a full
+ * store, next to the Argon2 verify each accepted claim leads to). Two maps, each in least recently
+ * touched order (a write re-inserts its key at the end): `fresh` for accounts still within their
+ * free failures, `delayed` for the ones that spent them. Past the cap the oldest `fresh` entry goes
+ * first; a `delayed` one only once `fresh` is empty — so a flood of made-up emails (all `fresh`)
+ * only evicts itself and cannot wipe the delay of an account under attack, which, being refused,
+ * is not touched and would be the first to go under plain LRU. Lapsed runs are treated as absent on
+ * read and dropped from the front of each map a few at a time on every write.
  */
-export class LoginFailureTracker {
-  private readonly windows = new Map<string, LoginFailureWindow>();
+export class LoginThrottleTracker {
+  private readonly fresh = new Map<string, Tracked>();
+  private readonly delayed = new Map<string, Tracked>();
   private writes = 0;
 
   constructor(
     private readonly maxTracked: number = LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX,
-    private readonly now: () => number = Date.now,
+    // A closure, not `Date.now` itself: a clock faked after construction (tests) is then honoured.
+    private readonly now: () => number = () => Date.now(),
   ) {
-    // countFailure evicts until `size < maxTracked`: below 1 (or NaN) that never holds on an empty
-    // map, and the eviction loop would spin forever.
+    // put() evicts until `size < maxTracked`: below 1 (or NaN) that never holds on an empty map,
+    // and the eviction loop would spin forever.
     if (!Number.isInteger(maxTracked) || maxTracked < 1) {
-      throw new RangeError(`LoginFailureTracker maxTracked must be an integer >= 1, got ${maxTracked}`);
+      throw new RangeError(`LoginThrottleTracker maxTracked must be an integer >= 1, got ${maxTracked}`);
     }
   }
 
-  private static key(email: string): string {
-    return sha256(email);
-  }
-
   /**
-   * Seconds until the account may try again when its budget is spent, null when it may try now.
-   * Checked before any password hashing.
+   * Asks to start a password check on `email`: refused (with the seconds to wait) while the account's
+   * delay runs, or while another of its checks is in flight in the delayed regime. An accepted check
+   * is counted as a failure right away, synchronously — before the caller's first await — so a
+   * burst of parallel attempts cannot all pass while their hashes run; its verdict then goes to
+   * `fail`, `release` or `reset`.
    */
-  throttledFor(email: string): number | null {
-    return loginThrottledFor(this.windows.get(LoginFailureTracker.key(email)), this.now());
-  }
-
-  /**
-   * Counts one attempt as a failure. Called BEFORE the password is verified, so a burst of parallel
-   * attempts cannot all slip past the check while their hashes run; a success then calls `reset`.
-   * Returns the end of the window the attempt was counted in, for `uncountFailure`.
-   */
-  countFailure(email: string): number {
-    const key = LoginFailureTracker.key(email);
+  claim(email: string): LoginClaim {
+    const key = sha256(email);
     const now = this.now();
-    const next = countLoginFailure(this.windows.get(key), now);
-    this.windows.delete(key);
-    if (++this.writes % 256 === 0) this.sweep(now);
-    if (this.windows.size >= this.maxTracked) this.sweep(now);
-    while (this.windows.size >= this.maxTracked) this.evictOne(now);
-    this.windows.set(key, next);
-    return next.endsAt;
+    const tracked = this.get(key, now);
+    const wait = loginRetryAfterMs(tracked?.state, now);
+    if (wait > 0) return { ok: false, retryAfter: retryAfterSeconds(wait) };
+    const { run, write } = this.put(key, claimLoginAttempt(tracked?.state, now), tracked?.run, now);
+    return { ok: true, attempt: { key, run, write, previousLastAt: tracked?.state.lastAt } };
+  }
+
+  /** A wrong password (or an unknown or inactive account): the count stays, the delay starts now. */
+  fail(attempt: LoginAttempt): void {
+    const now = this.now();
+    const tracked = this.current(attempt, now);
+    if (tracked) this.put(attempt.key, settleLoginFailure(tracked.state, now), tracked.run, now);
   }
 
   /**
-   * Takes back the up-front count of an attempt that never got a verdict (the lookup or the hash
-   * threw, answered 500, or the saturated Argon2 limiter refused it, answered 429): neither spends the
-   * account's budget. `windowEndsAt` is what `countFailure` returned: an attempt counted in a window
-   * that has since expired (or been reset) is not taken back from the one that replaced it — an
-   * attacker able to delay the refusal (a queued Argon2 wait) would otherwise cancel real guesses.
+   * Takes back a check that never got a verdict (the lookup or the hash threw, answered 500, or the
+   * saturated Argon2 limiter refused it, answered 429): neither spends the account's count. Only
+   * within the run it was counted in — an attacker able to delay the refusal (a queued Argon2 wait)
+   * cannot cancel failures of a run that replaced it. When nothing touched the account since the
+   * claim, the delay runs from the last failure again, as if the attempt never happened.
    */
-  uncountFailure(email: string, windowEndsAt: number): void {
-    const key = LoginFailureTracker.key(email);
-    const entry = this.windows.get(key);
-    if (!entry || entry.endsAt !== windowEndsAt) return;
-    if (entry.failures <= 1) this.windows.delete(key);
-    else this.windows.set(key, { failures: entry.failures - 1, endsAt: entry.endsAt });
+  release(attempt: LoginAttempt): void {
+    const now = this.now();
+    const tracked = this.current(attempt, now);
+    if (!tracked) return;
+    const untouched = tracked.write === attempt.write;
+    const state = releaseLoginAttempt(tracked.state, untouched ? attempt.previousLastAt : undefined);
+    if (state) this.put(attempt.key, state, tracked.run, now);
+    else this.drop(attempt.key);
   }
 
+  /** A successful login: the account starts afresh, checks still in flight included. */
   reset(email: string): void {
-    this.windows.delete(LoginFailureTracker.key(email));
+    this.drop(sha256(email));
   }
 
   get size(): number {
-    return this.windows.size;
+    return this.fresh.size + this.delayed.size;
+  }
+
+  private get(key: string, now: number): Tracked | undefined {
+    const tracked = this.fresh.get(key) ?? this.delayed.get(key);
+    if (tracked && hasLoginThrottleLapsed(tracked.state, now)) {
+      this.drop(key);
+      return undefined;
+    }
+    return tracked;
+  }
+
+  private current(attempt: LoginAttempt, now: number): Tracked | undefined {
+    const tracked = this.get(attempt.key, now);
+    return tracked?.run === attempt.run ? tracked : undefined;
+  }
+
+  private drop(key: string): void {
+    if (!this.fresh.delete(key)) this.delayed.delete(key);
   }
 
   /**
-   * Drops the least recently counted entry that is not throttled. A throttled account is never
-   * counted again while refused, so plain LRU would evict it first and a flood of made-up emails
-   * would wipe its lockout; it goes only once every tracked entry is throttled.
+   * Stores `state` as the account's latest, at the back of its map, in `run` — or in a new run this
+   * write opens when undefined. Returns the entry stored.
    */
-  private evictOne(now: number): void {
-    let victim: string | undefined;
-    for (const [k, w] of this.windows) {
-      victim ??= k;
-      if (loginThrottledFor(w, now) === null) {
-        victim = k;
-        break;
-      }
-    }
-    if (victim !== undefined) this.windows.delete(victim);
+  private put(key: string, state: LoginThrottleState, run: number | undefined, now: number): Tracked {
+    this.drop(key);
+    this.sweep(now);
+    while (this.size >= this.maxTracked) this.evictOldest();
+    const write = ++this.writes;
+    const tracked: Tracked = { state, run: run ?? write, write };
+    (isLoginDelayed(state) ? this.delayed : this.fresh).set(key, tracked);
+    return tracked;
   }
 
+  private evictOldest(): void {
+    const map = this.fresh.size > 0 ? this.fresh : this.delayed;
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+
+  /** Drops lapsed runs from the front (least recently touched end) of each map, a few per call. */
   private sweep(now: number): void {
-    for (const [k, w] of this.windows) if (!isLoginFailureWindowOpen(w, now)) this.windows.delete(k);
+    for (const map of [this.fresh, this.delayed]) {
+      let budget = SWEEP_BUDGET;
+      for (const [key, tracked] of map) {
+        if (budget-- === 0 || !hasLoginThrottleLapsed(tracked.state, now)) break;
+        map.delete(key);
+      }
+    }
   }
 }

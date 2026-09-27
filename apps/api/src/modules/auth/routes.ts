@@ -19,7 +19,7 @@ import {
   validationError,
 } from '../../lib/api.js';
 import { hashPassword, verifyPassword, verifyThenHash } from '../../lib/password.js';
-import { LoginFailureTracker, globalAddressLimit } from '../../lib/rate-limit.js';
+import { LoginThrottleTracker, globalAddressLimit } from '../../lib/rate-limit.js';
 import { nextCredentialVersion } from '../../plugins/auth.js';
 import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
 
@@ -44,12 +44,12 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // time and yields the same 401 as a wrong password (no user enumeration). A hand-written
   // hash string would make argon2 throw and turn the unknown-email branch into a 500.
   const dummyHash = await hashPassword(`dummy-${Date.now()}`);
-  // Per-account budget (LOGIN_FAILURES_PER_ACCOUNT per LOGIN_FAILURE_WINDOW_MS), one per app instance.
-  const loginFailures = new LoginFailureTracker();
+  // Per-account progressive delay (see LOGIN_FREE_FAILURES), one store per app instance.
+  const loginThrottle = new LoginThrottleTracker();
 
   // --- POST /api/v1/auth/login ---------------------------------------------
-  // Two budgets: per client address (the route limit, an IPv6 client per /64) and per account
-  // (loginFailures), so rotating through many addresses buys no more guesses on one account.
+  // Two limits: per client address (the route limit, an IPv6 client per /64) and per account
+  // (loginThrottle), so rotating through many addresses buys no faster guessing on one account.
   app.post(
     '/auth/login',
     { config: { rateLimit: { max: LOGIN_ATTEMPTS_PER_MINUTE, timeWindow: '1 minute' } } },
@@ -59,15 +59,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       const { password } = parsed.data;
       const email = parsed.data.email.toLowerCase();
 
-      // Spent budget: refused before any lookup or hashing, the same way for a known and an unknown
-      // email (both are counted alike below), so the 429 reveals nothing about the account.
-      const retryAfter = loginFailures.throttledFor(email);
-      if (retryAfter !== null) {
-        return reply.status(429).header('retry-after', retryAfter).send(apiError('RATE_LIMITED'));
+      // Inside the account's delay (or with one of its checks in flight once delayed): refused before
+      // any lookup or hashing, the same way for a known and an unknown email (both are tracked
+      // alike), so the 429 reveals nothing about the account. Claimed synchronously, before the first
+      // await: parallel attempts cannot all pass while their hashes run.
+      const claim = loginThrottle.claim(email);
+      if (!claim.ok) {
+        return reply.status(429).header('retry-after', claim.retryAfter).send(apiError('RATE_LIMITED'));
       }
-      // Counted up front, cleared on success: parallel attempts cannot all pass the check above
-      // while their hashes run.
-      const failureWindow = loginFailures.countFailure(email);
+      const { attempt } = claim;
 
       const { admin, ok } = await (async () => {
         const found = await app.prisma.admin.findUnique({ where: { email } });
@@ -77,14 +77,15 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
         // A server fault (answered 500) is no wrong guess, and neither is a refusal of the saturated
         // Argon2 limiter (PasswordHashingBusyError, answered 429 RATE_LIMITED by the error handler —
         // for a known and an unknown email alike, the dummy verify queuing the same way): give the
-        // attempt back, to the window it was counted in only.
-        loginFailures.uncountFailure(email, failureWindow);
+        // attempt back, to the run it was counted in only.
+        loginThrottle.release(attempt);
         throw err;
       });
       if (!admin || !ok || !admin.isActive) {
+        loginThrottle.fail(attempt);
         return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
       }
-      loginFailures.reset(email);
+      loginThrottle.reset(email);
 
       app.issueAccessToken(reply, admin);
       await app.issueRefreshToken(reply, admin.id, admin.passwordChangedAt);

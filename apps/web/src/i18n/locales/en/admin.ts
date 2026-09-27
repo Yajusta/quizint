@@ -24,6 +24,7 @@ export default {
     submit: 'Sign in',
     errorMissing: 'Enter your email address and your password.',
     errorRateLimited: 'Too many attempts. Try again in a moment.',
+    errorRateLimitedIn: 'Too many attempts. Try again in <num>{{seconds}}</num> s.',
     errorCredentials: 'Incorrect credentials',
     errorNetwork: 'Could not connect. Please try again.',
   },

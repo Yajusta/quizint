@@ -29,6 +29,7 @@ export default {
     submit: 'Se connecter',
     errorMissing: 'Saisissez votre adresse e-mail et votre mot de passe.',
     errorRateLimited: 'Trop de tentatives. Réessayez dans un instant.',
+    errorRateLimitedIn: `Trop de tentatives. Réessayez dans <num>{{seconds}}</num>${NBSP}s.`,
     errorCredentials: 'Identifiants incorrects',
     errorNetwork: 'Connexion impossible. Réessayez.',
   },

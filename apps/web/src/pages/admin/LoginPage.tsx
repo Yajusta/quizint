@@ -1,20 +1,27 @@
 // Back-office login (plan § 5.3): wordmark centred above a 400 px card.
 // The authentication logic (httpOnly cookie, undifferentiated error message) is unchanged.
 
-import { useState } from 'react';
-import { useTranslation } from 'react-i18next';
+import { useState, type ReactNode } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 
 import { LanguageSwitcher } from '../../components/LanguageSwitcher.tsx';
 import { Button, Card, Field, Input, Wordmark } from '../../design-system/index.ts';
 import { resetMe } from '../../lib/admin-identity.ts';
+import { Num } from '../participant/shells.tsx';
+
+/** Whole seconds from a Retry-After header in its delay-seconds form, null otherwise. */
+function retryAfterHeader(res: Response): number | null {
+  const value = res.headers.get('retry-after');
+  return value !== null && /^\d+$/.test(value.trim()) && Number(value) > 0 ? Number(value) : null;
+}
 
 export function LoginPage() {
   const { t } = useTranslation('admin');
   const navigate = useNavigate();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<ReactNode>(null);
   const [loading, setLoading] = useState(false);
 
   const submit = async (e: React.FormEvent) => {
@@ -41,8 +48,23 @@ export function LoginPage() {
         return;
       }
       const body = (await res.json().catch(() => null)) as { error?: { code: string } } | null;
+      if (body?.error?.code !== 'RATE_LIMITED') {
+        setError(t('login.errorCredentials'));
+        return;
+      }
+      // The per-account delay says how long to wait: shown when the header carries it.
+      const seconds = retryAfterHeader(res);
       setError(
-        body?.error?.code === 'RATE_LIMITED' ? t('login.errorRateLimited') : t('login.errorCredentials'),
+        seconds === null ? (
+          t('login.errorRateLimited')
+        ) : (
+          <Trans
+            i18nKey="login.errorRateLimitedIn"
+            ns="admin"
+            values={{ seconds }}
+            components={{ num: <Num /> }}
+          />
+        ),
       );
     } catch {
       setError(t('login.errorNetwork'));

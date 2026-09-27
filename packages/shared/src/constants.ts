@@ -78,16 +78,30 @@ export const API_REQUESTS_PER_MINUTE = 2000;
 export const JWT_SECRET_MIN_LENGTH = 32;
 export const JWT_SECRET_MIN_DISTINCT_CHARS = 8;
 /**
- * Per-account login budget, on top of the per-address one: past LOGIN_FAILURES_PER_ACCOUNT failed
- * attempts on one email within LOGIN_FAILURE_WINDOW_MS (counted from the first), every further attempt
- * on that email is refused RATE_LIMITED without hashing anything until the window ends — whatever the
- * address it comes from. Unknown emails are counted exactly like known ones (no enumeration).
+ * Per-account login delay, on top of the per-address budget — a progressive delay rather than a hard lockout:
+ * - the first LOGIN_FREE_FAILURES failures on one email cost nothing extra;
+ * - each further failure makes the next password check on that email wait
+ *   min(LOGIN_DELAY_BASE_MS × 2^(n − LOGIN_FREE_FAILURES − 1), LOGIN_DELAY_MAX_MS) after it, n being
+ *   the failures counted so far (1 s, 2 s, 4 s, 8 s, 16 s, then 30 s for good);
+ * - an attempt arriving earlier is refused RATE_LIMITED (Retry-After) without hashing anything,
+ *   whatever the address it comes from; one arriving later is checked, and the right password
+ *   signs in and clears the count. Guessing is held to about two tries a minute per account
+ *   (~120 an hour, whatever the number of addresses), and no failure count ever makes a wait
+ *   longer than LOGIN_DELAY_MAX_MS. It is not a lockout guarantee, though: the delay is shared by
+ *   everyone trying the email, so an attacker who fires the instant each delay ends takes that
+ *   slot first, and the real admin's attempts keep landing inside the next delay for as long as
+ *   the attack runs (closing that needs a per-device exemption, e.g. a device cookie);
+ * - the count lapses after LOGIN_FAILURE_RESET_MS without any attempt on the email.
+ * Unknown emails are counted exactly like known ones (no enumeration).
  */
-export const LOGIN_FAILURES_PER_ACCOUNT = 10;
-export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+export const LOGIN_FREE_FAILURES = 5;
+export const LOGIN_DELAY_BASE_MS = 1_000;
+export const LOGIN_DELAY_MAX_MS = 30_000;
+export const LOGIN_FAILURE_RESET_MS = 15 * 60 * 1000;
 /**
- * Emails the per-account counter tracks at once: past it, the oldest entry is evicted, so a flood of
- * made-up emails costs bounded memory (a key is a fixed-size hash, ~100 bytes a slot).
+ * Emails the per-account counter tracks at once: past it, an entry is evicted — the least recently
+ * touched one that has not spent its free failures, so a flood of made-up emails costs bounded
+ * memory (a key is a fixed-size hash, ~100 bytes a slot) without wiping an account's delay.
  */
 export const LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX = 20_000;
 /**
@@ -96,7 +110,7 @@ export const LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX = 20_000;
  * threads of its own lanes (argon2's default parallelism, 4), and 64 MiB for ~0.1 s: at most
  * ARGON2_MAX_CONCURRENCY run at once (bounding the pool slots and memory taken, not all CPU contention), at most ARGON2_MAX_QUEUE wait behind them, and a wait
  * longer than ARGON2_QUEUE_TIMEOUT_MS gives up. Past either bound the request is refused RATE_LIMITED
- * (Retry-After ARGON2_BUSY_RETRY_AFTER_S) without touching the account's login budget, so a burst of
+ * (Retry-After ARGON2_BUSY_RETRY_AFTER_S) without touching the account's login delay, so a burst of
  * pre-auth logins from many addresses cannot starve the rest of the process.
  */
 export const ARGON2_MAX_CONCURRENCY = 2;

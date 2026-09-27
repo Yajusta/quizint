@@ -16,7 +16,7 @@ export const ARGON_OPTS = { memoryCost: 65536, timeCost: 3 } as const;
 /**
  * The password limiter is saturated (queue full, or the wait timed out). A RateLimitedError, so the
  * app's error handler answers it 429 RATE_LIMITED with a Retry-After; the login route gives the
- * attempt back to the account budget like any other thrown error.
+ * attempt back to the account's login delay like any other thrown error.
  */
 export class PasswordHashingBusyError extends RateLimitedError {
   constructor() {

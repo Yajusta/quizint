@@ -1,10 +1,12 @@
-// Rate-limit rules: which bucket a client address falls in, and the per-account login failure window.
+// Rate-limit rules: which bucket a client address falls in, and the per-account login delay.
 // No `node:net` here, the package stays free of Node imports: IPv6 parsing and RFC 5952 formatting go
 // through the WHATWG `URL` host parser, a global in Node and in browsers alike.
 
 import {
-  LOGIN_FAILURES_PER_ACCOUNT,
-  LOGIN_FAILURE_WINDOW_MS,
+  LOGIN_DELAY_BASE_MS,
+  LOGIN_DELAY_MAX_MS,
+  LOGIN_FAILURE_RESET_MS,
+  LOGIN_FREE_FAILURES,
   RATE_LIMIT_IPV6_PREFIX_LENGTH,
 } from './constants.js';
 
@@ -58,42 +60,98 @@ export function rateLimitKey(ip: string, prefixLength: number = RATE_LIMIT_IPV6_
   return `${canonicalIpv6(network.join(':'))}/${bits}`;
 }
 
-// --- Per-account login failures ----------------------------------------------------------------
+// --- Per-account login delay (see LOGIN_FREE_FAILURES) -------------------------------------------
 
-/** Failed login attempts on one account, in a fixed window opened by the first of them. */
-export interface LoginFailureWindow {
+/**
+ * One account's current run of failed logins. An attempt is counted when its check starts (so a
+ * burst of parallel attempts cannot all pass the delay while their hashes run) and settled when the
+ * verdict lands: a failure keeps the count and restarts the delay from the verdict, a success drops
+ * the whole state, a check that never got a verdict (server fault, saturated Argon2) is taken back.
+ */
+export interface LoginThrottleState {
+  /** Attempts counted in this run: failures, plus the checks still in flight. */
   readonly failures: number;
-  /** Epoch ms at which the window closes and the account starts afresh. */
-  readonly endsAt: number;
+  /** Epoch ms of the latest attempt started or failure verdict: the delay and the lapse run from it. */
+  readonly lastAt: number;
+  /** Checks started and not settled yet. */
+  readonly inFlight: number;
 }
 
-/** True while `entry` is open. A closed one counts as no failure at all. */
-export function isLoginFailureWindowOpen(
-  entry: LoginFailureWindow | undefined,
-  now: number,
-): entry is LoginFailureWindow {
-  return entry !== undefined && now < entry.endsAt;
+/** The wait `failures` counted failures impose before the next check: 0 while some are still free. */
+export function loginDelayMs(
+  failures: number,
+  free: number = LOGIN_FREE_FAILURES,
+  baseMs: number = LOGIN_DELAY_BASE_MS,
+  maxMs: number = LOGIN_DELAY_MAX_MS,
+): number {
+  if (failures <= free) return 0;
+  return Math.min(baseMs * 2 ** (failures - free - 1), maxMs);
 }
 
 /**
- * Whole seconds (at least 1, for a `Retry-After` header) until the account may try again when it has
- * spent its budget, null when it may try now.
+ * True once the account has spent its free failures on settled verdicts: the next one starts (or
+ * keeps) the delay. Checks still in flight do not count — they may yet be taken back, and a burst
+ * of claims that are later released must not buy an entry the eviction protection of a real one.
  */
-export function loginThrottledFor(
-  entry: LoginFailureWindow | undefined,
-  now: number,
-  maxFailures: number = LOGIN_FAILURES_PER_ACCOUNT,
-): number | null {
-  if (!isLoginFailureWindowOpen(entry, now) || entry.failures < maxFailures) return null;
-  return Math.max(1, Math.ceil((entry.endsAt - now) / 1000));
+export function isLoginDelayed(state: LoginThrottleState, free: number = LOGIN_FREE_FAILURES): boolean {
+  return state.failures - state.inFlight >= free;
 }
 
-/** The window after one more failure: opens a fresh one when none is open, never moves its end. */
-export function countLoginFailure(
-  entry: LoginFailureWindow | undefined,
+/**
+ * True when there is no run to speak of: none at all, or none touched for `resetMs`. A check in
+ * flight that long never settled (it would have within seconds), so it does not keep the run alive.
+ */
+export function hasLoginThrottleLapsed(
+  state: LoginThrottleState | undefined,
   now: number,
-  windowMs: number = LOGIN_FAILURE_WINDOW_MS,
-): LoginFailureWindow {
-  if (!isLoginFailureWindowOpen(entry, now)) return { failures: 1, endsAt: now + windowMs };
-  return { failures: entry.failures + 1, endsAt: entry.endsAt };
+  resetMs: number = LOGIN_FAILURE_RESET_MS,
+): state is undefined {
+  return state === undefined || now - state.lastAt >= resetMs;
+}
+
+/**
+ * Milliseconds before the account may start a check, 0 when it may start one now. In the delayed
+ * regime a check already in flight holds the account: only one runs at a time, and the wait asked
+ * is a full delay, the least a failure verdict will impose.
+ */
+export function loginRetryAfterMs(state: LoginThrottleState | undefined, now: number): number {
+  if (hasLoginThrottleLapsed(state, now)) return 0;
+  const delay = loginDelayMs(state.failures);
+  if (delay === 0) return 0;
+  if (state.inFlight > 0) return delay;
+  // Clamped to the delay: a wall clock stepped backwards (NTP, VM resume) never stretches the wait.
+  return Math.min(delay, Math.max(0, state.lastAt + delay - now));
+}
+
+/** Whole seconds for a Retry-After header: at least 1. */
+export function retryAfterSeconds(ms: number): number {
+  return Math.max(1, Math.ceil(ms / 1000));
+}
+
+/** The state once a check starts: counted up front, as a failure until its verdict says otherwise. */
+export function claimLoginAttempt(state: LoginThrottleState | undefined, now: number): LoginThrottleState {
+  if (hasLoginThrottleLapsed(state, now)) return { failures: 1, lastAt: now, inFlight: 1 };
+  return { failures: state.failures + 1, lastAt: now, inFlight: state.inFlight + 1 };
+}
+
+/** The state once a started check fails: the count stays, the delay runs from the verdict. */
+export function settleLoginFailure(state: LoginThrottleState, now: number): LoginThrottleState {
+  return { failures: state.failures, lastAt: now, inFlight: Math.max(0, state.inFlight - 1) };
+}
+
+/**
+ * The state once a started check is taken back (no verdict: a fault, a saturated Argon2 limiter),
+ * undefined when nothing is left. `restoreLastAt` is the `lastAt` the claim replaced, passed when
+ * nothing touched the state since: the delay then runs from the last failure again, as if the
+ * refused attempt never happened. Without it `lastAt` stays where the claim put it, and at worst
+ * the next check waits one delay from the refused attempt (bounded by LOGIN_DELAY_MAX_MS).
+ */
+export function releaseLoginAttempt(
+  state: LoginThrottleState,
+  restoreLastAt?: number,
+): LoginThrottleState | undefined {
+  const failures = state.failures - 1;
+  const inFlight = Math.max(0, state.inFlight - 1);
+  if (failures <= 0 && inFlight === 0) return undefined;
+  return { failures: Math.max(0, failures), lastAt: restoreLastAt ?? state.lastAt, inFlight };
 }

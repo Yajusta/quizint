@@ -18,7 +18,8 @@ import {
   ENDED_PURGE_DELAY_MS,
   IMAGE_MAX_INPUT_PIXELS,
   LOGIN_ATTEMPTS_PER_MINUTE,
-  LOGIN_FAILURES_PER_ACCOUNT,
+  LOGIN_DELAY_MAX_MS,
+  LOGIN_FREE_FAILURES,
   MAX_JOINS_PER_SECOND_PER_SESSION,
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
@@ -3310,7 +3311,14 @@ describe('login throttling', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }, () => {
   let nextNet = 0x100;
   const freshNet = () => nextNet++;
   const password = 'throttle-pass-12';
-  const emails = ['throttle-target@example.fr', 'throttle-bystander@example.fr', 'throttle-reset@example.fr'];
+  const [target, bystander, resetEmail, siege, parallel] = [
+    'throttle-target@example.fr',
+    'throttle-bystander@example.fr',
+    'throttle-reset@example.fr',
+    'throttle-siege@example.fr',
+    'throttle-parallel@example.fr',
+  ];
+  const emails = [target, bystander, resetEmail, siege, parallel];
   const login = (at: { remoteAddress: string; xff: string }, email: string, pass: string) =>
     app.inject({
       method: 'POST',
@@ -3351,37 +3359,122 @@ describe('login throttling', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }, () => {
     expect(other.statusCode).toBe(401);
   });
 
-  it('an account refuses any attempt once its failures are spent, from any address', async () => {
-    const [target, bystander] = [emails[0]!, emails[1]!];
-    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) {
+  // The per-account delay runs on Date: a frozen clock makes each test deterministic, moved forward
+  // by hand to "wait". Timers stay real (only Date is faked).
+  const freezeClock = () => {
+    vi.useFakeTimers({ toFake: ['Date'], now: Date.now() });
+    onTestFinished(() => void vi.useRealTimers());
+  };
+  const wait = (seconds: number) => vi.setSystemTime(Date.now() + seconds * 1000);
+  const retryAfterOf = (res: Awaited<ReturnType<typeof login>>) => Number(res.headers['retry-after']);
+
+  it('past the free failures, an early retry is refused and the right password signs in once waited', async () => {
+    freezeClock();
+    for (let i = 0; i <= LOGIN_FREE_FAILURES; i++) {
       const res = await login(from(freshNet()), target, `wrong-guess-${i}-pad`);
       expect(res.statusCode).toBe(401);
       expect(res.json().error.code).toBe('INVALID_CREDENTIALS');
     }
-    // Even the right password, from a fresh address, in any letter case: not checked at all.
-    expectRateLimited(await login(from(freshNet()), target, password));
+    // Inside the delay: not checked at all, even the right password, from a fresh address, in any
+    // letter case.
+    const early = await login(from(freshNet()), target, password);
+    expectRateLimited(early);
+    expect(retryAfterOf(early)).toBe(1);
     expectRateLimited(await login(from(freshNet()), target.toUpperCase(), password));
     // Another account is unaffected.
     expect((await login(from(freshNet()), bystander, password)).statusCode).toBe(200);
+    // Once waited, the right password is checked and signs in, which clears the count: the free
+    // failures are free again.
+    wait(retryAfterOf(early));
+    expect((await login(from(freshNet()), target, password)).statusCode).toBe(200);
+    for (let i = 0; i <= LOGIN_FREE_FAILURES; i++) {
+      expect((await login(from(freshNet()), target, `wrong-again-${i}-pad`)).statusCode).toBe(401);
+    }
+  });
+
+  it('however many guesses, no wait exceeds the cap, and the right password signs in once it has run', async () => {
+    freezeClock();
+    // The attacker takes every check the moment it is allowed, until the delay reaches its cap.
+    let guesses = 0;
+    while (guesses < LOGIN_FREE_FAILURES + 8) {
+      const res = await login(from(freshNet()), siege, `wrong-guess-${guesses}-pad`);
+      if (res.statusCode === 429) {
+        expect(retryAfterOf(res)).toBeLessThanOrEqual(LOGIN_DELAY_MAX_MS / 1000);
+        wait(retryAfterOf(res));
+        continue;
+      }
+      expect(res.statusCode).toBe(401);
+      guesses++;
+    }
+    // The admin, right behind the attacker's latest guess: refused, told to wait the cap at most.
+    const refused = await login(from(freshNet()), siege, password);
+    expectRateLimited(refused);
+    expect(retryAfterOf(refused)).toBe(LOGIN_DELAY_MAX_MS / 1000);
+    wait(retryAfterOf(refused));
+    expect((await login(from(freshNet()), siege, password)).statusCode).toBe(200);
   });
 
   it('an unknown email is counted exactly like a known one', async () => {
+    freezeClock();
     const ghost = 'throttle-ghost@example.fr';
-    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) {
+    for (let i = 0; i <= LOGIN_FREE_FAILURES; i++) {
       expect((await login(from(freshNet()), ghost, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
     }
-    expectRateLimited(await login(from(freshNet()), ghost, 'wrong-guess-last'));
+    const early = await login(from(freshNet()), ghost, 'wrong-guess-last');
+    expectRateLimited(early);
+    expect(retryAfterOf(early)).toBe(1);
+    wait(1);
+    expect((await login(from(freshNet()), ghost, 'wrong-guess-last')).statusCode).toBe(401);
+    expect(retryAfterOf(await login(from(freshNet()), ghost, 'wrong-guess-again'))).toBe(2);
   });
 
   it('a successful login clears the account failures', async () => {
-    const email = emails[2]!;
+    freezeClock();
     for (let round = 0; round < 2; round++) {
-      for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT - 1; i++) {
-        expect((await login(from(freshNet()), email, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
+      for (let i = 0; i < LOGIN_FREE_FAILURES; i++) {
+        expect((await login(from(freshNet()), resetEmail, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
       }
-      // 9 + 1 + 9 attempts in all: without the reset, the second round would end in 429s.
-      expect((await login(from(freshNet()), email, password)).statusCode).toBe(200);
+      // Without the reset, the second round would run into the delay (the clock does not move).
+      expect((await login(from(freshNet()), resetEmail, password)).statusCode).toBe(200);
     }
+  });
+
+  it('once delayed, a check in flight holds the account: parallel attempts are not verified', async () => {
+    freezeClock();
+    for (let i = 0; i <= LOGIN_FREE_FAILURES; i++) {
+      expect((await login(from(freshNet()), parallel, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
+    }
+    wait(1);
+    // Hold every running Argon2 slot, so the next check stays in flight (queued) until released.
+    expect({ running: argon2Limiter.running, queued: argon2Limiter.queued }).toEqual({
+      running: 0,
+      queued: 0,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const held = Array.from({ length: ARGON2_MAX_CONCURRENCY }, () => argon2Limiter.run(() => gate));
+    try {
+      const inFlight = login(from(freshNet()), parallel, 'wrong-guess-in-flight');
+      await vi.waitFor(() => expect(argon2Limiter.queued).toBe(1));
+      // Well past any delay: still refused while that check is out, the right password included,
+      // and none of these reach Argon2.
+      wait(60);
+      const burst = await Promise.all(
+        Array.from({ length: 4 }, () => login(from(freshNet()), parallel, password)),
+      );
+      for (const res of burst) expectRateLimited(res);
+      expect(argon2Limiter.queued).toBe(1);
+      release();
+      expect((await inFlight).statusCode).toBe(401);
+    } finally {
+      release();
+      await Promise.all(held);
+    }
+    // Its failure restarted the delay: 2 s for the 7th.
+    const early = await login(from(freshNet()), parallel, password);
+    expect(retryAfterOf(early)).toBe(2);
+    wait(2);
+    expect((await login(from(freshNet()), parallel, password)).statusCode).toBe(200);
   });
 
   describe('saturated Argon2 limiter', () => {
@@ -3416,14 +3509,15 @@ describe('login throttling', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }, () => {
       await app.prisma.admin.deleteMany({ where: { email: busyEmail } });
     });
 
-    it('login answers 429 RATE_LIMITED, known email or not, without spending the account budget', async () => {
-      for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT - 1; i++) {
+    it('login answers 429 RATE_LIMITED, known email or not, without spending the account delay', async () => {
+      freezeClock();
+      for (let i = 0; i < LOGIN_FREE_FAILURES; i++) {
         expect((await login(from(freshNet()), busyEmail, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
       }
       const unsaturate = saturate();
       try {
-        // One attempt short of the lockout: were any of these counted, the right password below
-        // would be refused.
+        // The free failures are spent and the clock does not move: had any of these been counted
+        // (or restarted the delay), the right password below would be refused.
         for (let i = 0; i < 3; i++) {
           expectRateLimited(await login(from(freshNet()), busyEmail, `wrong-guess-busy-${i}`));
         }
