@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+Account roles. One new migration (`20260927160759_account_roles`): every existing account, deactivated ones included, becomes `ADMIN`; demote the ones that should be `USER` after deploy.
+
+- Auth: accounts are `ADMIN` or `USER`. A `USER` manages only their own quizzes, sessions and password; an `ADMIN` also manages accounts. New accounts are `USER` by default, and the seed creates an `ADMIN`.
+- Auth: `/admins` routes answer 403 to a `USER`. The role is read on every request, so a promotion or a demotion applies at once.
+- Auth: an admin can promote or demote another account. At least one active `ADMIN` always remains (`LAST_ADMIN`).
+- Auth: an `ADMIN` can reset another account's password (`POST /admins/:id/password`). This signs the account out everywhere and lifts its login delay. It is rate-limited per admin. An account still changes its own password through change-password.
+- Web: the accounts page reads "Accounts" for an `ADMIN` (roles, promote/demote, reset password, role on creation) and "My account" for a `USER` (own password only).
+
 ## 0.1.1 (2026-09-27)
 
 Security audit remediation. Two new migrations (`20260926110000_admin_password_changed_at`, `20260926120000_quiz_played_question_ids`), applied by `prisma migrate deploy` at container start.

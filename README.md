@@ -17,7 +17,9 @@ pnpm dev                                                # api :3000 + web :5173
 
 Default credentials: `admin@example.fr` / `admin-password-12` (from seed — change upon setup).
 
-> No database service to launch: the database is a SQLite file (`apps/api/data/quiz.db`) created automatically by the migration, which creates the tables; the seed creates the initial admin user (§5.1).
+> No database service to launch: the database is a SQLite file (`apps/api/data/quiz.db`) created automatically by the migration, which creates the tables; the seed creates the initial admin user (§5.1), with the `ADMIN` role.
+
+Accounts have a role: `ADMIN` creates accounts, changes roles, deactivates and resets other accounts' passwords; `USER` (the default for a new account) manages only its own quizzes, sessions and password. Quizzes and sessions stay private to their owner whatever the role. At least one active `ADMIN` always remains.
 
 ## User Journeys
 
@@ -29,6 +31,7 @@ Default credentials: `admin@example.fr` / `admin-password-12` (from seed — cha
 | Admin       | `/admin`              | Dashboard: quizzes, active sessions, JSON import                                   |
 | Admin       | `/admin/quizzes/:id`  | Editor: 4 question types, media, participant preview                               |
 | Admin       | `/admin/sessions`     | History, stats, CSV exports                                                        |
+| Admin       | `/admin/admins`       | Accounts: an ADMIN manages every account, a USER changes its own password          |
 | Presenter   | `/present/:sessionId` | Projected view: QR + code, timer, gauges, bar charts, podium (Space/F/P shortcuts) |
 
 ## Commands
@@ -103,7 +106,7 @@ docker compose up -d --build
 
 `JWT_SECRET` signs the admin JWTs: generate it with `openssl rand -base64 48` (or `node -e "console.log(require('crypto').randomBytes(48).toString('base64'))"`). The API refuses to start without it, with the template value, or with an obviously weak secret (under 32 bytes, fewer than 8 distinct characters, a repeated pattern). The public development secret is only accepted when `NODE_ENV` is explicitly `development` or `test`: an unset `NODE_ENV` counts as production (`pnpm dev` and `db:seed` set `development` themselves).
 
-Upgrading an existing deployment: migration `20260926130000_refresh_token_credential_version` binds each refresh token to the admin's credential version and has no backfill on purpose. Admins who changed their password at least once must therefore sign in again after the deploy; the others keep their sessions.
+Upgrading an existing deployment: migration `20260926130000_refresh_token_credential_version` binds each refresh token to the admin's credential version and has no backfill on purpose. Admins who changed their password at least once must therefore sign in again after the deploy; the others keep their sessions. Migration `20260927160759_account_roles` gives every existing account, deactivated ones included, the `ADMIN` role, so nobody loses account management; demote the ones that should be `USER` from the accounts page.
 
 Caddy serves the static frontend and reverse proxies `/api`, `/socket.io`, and `/uploads` to the API. The entrypoint runs `prisma migrate deploy`, executes the seed, and starts Fastify (non-root user). `@quiz/shared` is a source package: it exports TypeScript and emits no build artifacts. The image build compiles it alongside the API into an ESM bundle (esbuild, `apps/api/scripts/build.mjs`); installed dependencies remain external, as argon2, sharp, and `@prisma/client` include native binaries or engine binaries. As a result, the production image contains only compiled JavaScript (`node dist/server.js`) and `prisma/` for migrations — neither source code nor compilers are present at runtime. `tsc --noEmit` acts as a type safety gate prior to bundling, and `.dockerignore` keeps host artifacts out of the build context.
 
