@@ -16,6 +16,7 @@ import {
   sha256,
   type AdminJwtPayload,
 } from '../lib/api.js';
+import type { PresenterSocketData } from './live.js';
 import { REQUEST_TX_OPTIONS } from './prisma.js';
 
 const ACCESS_TTL_SEC = 15 * 60; // 15 min
@@ -261,23 +262,48 @@ async function plugin(app: FastifyInstance): Promise<void> {
   );
 
   /**
+   * revokeAdminSessions sweeps the presenter sockets from `nsp.sockets`, which socket.io only fills
+   * a tick after the handshake's `next()`: a handshake still running its awaits (ownership, load,
+   * snapshot) when the sweep passes would connect afterwards on a revoked identity. The handshake
+   * takes a mark before verifying the token and asks whether the admin was revoked since, once
+   * before sending its snapshot and again on `connection`. A global sequence, not a clock: two events
+   * in the same millisecond still order.
+   * One entry per admin ever revoked in this process — a handful.
+   */
+  let revocationSeq = 0;
+  const adminRevokedAt = new Map<string, number>();
+  app.decorate('revocationMark', () => revocationSeq);
+  app.decorate(
+    'adminRevokedSince',
+    (adminId: string, mark: number) => (adminRevokedAt.get(adminId) ?? 0) > mark,
+  );
+
+  /**
    * Ends every session of an admin: refresh tokens revoked and expired (no rotation grace), and
    * their presenter sockets disconnected. Called on password change and deactivation, both of which
-   * bump the credential version (`passwordChangedAt`) first. Access JWTs are covered by
+   * bump the credential version (`passwordChangedAt`) first. PRECONDITION for any new caller: that
+   * bump (or the deactivation) is committed before the call — the handshake stamp below relies on a
+   * handshake starting after it failing its own token verification. Access JWTs are covered by
    * `verifyAccessToken`: it re-checks `isActive` and the credential version on every request, so a
    * JWT signed before either change is refused at once — and still after a reactivation.
    * Refresh tokens do not rely on this sweep alone either: verifyRefreshToken re-checks `isActive`
    * and the row's `credentialVersion`, so a successor minted by a rotation racing the sweep is refused.
    */
   app.decorate('revokeAdminSessions', async (adminId: string) => {
+    // Stamped first, synchronously: every caller has already committed the credential bump, so a
+    // presenter handshake that took its mark before this line may have verified the old version, and
+    // one that took it after cannot have (see adminRevokedSince).
+    adminRevokedAt.set(adminId, ++revocationSeq);
+    // The sockets go before the database write: a failing write (a busy pool) must not leave a
+    // revoked presenter driving its session. The refresh tokens are re-checked on use anyway.
+    for (const socket of app.io.of('/presenter').sockets.values()) {
+      if ((socket.data as Partial<PresenterSocketData>).adminId === adminId) socket.disconnect(true);
+    }
     const at = new Date();
     await app.prisma.refreshToken.updateMany({
       where: { adminId, revokedAt: null },
       data: { revokedAt: at, expiresAt: at },
     });
-    for (const socket of app.io.of('/presenter').sockets.values()) {
-      if ((socket.data as { adminId?: string }).adminId === adminId) socket.disconnect(true);
-    }
   });
 
   // Verify a refresh token and detect reuse of a revoked one (→ revoke the whole family).
@@ -341,6 +367,10 @@ declare module 'fastify' {
      */
     verifyRefreshToken: (req: FastifyRequest) => Promise<RefreshTokenResult>;
     revokeAdminSessions: (adminId: string) => Promise<void>;
+    /** The current revocation sequence: taken by a presenter handshake before it verifies the token. */
+    revocationMark: () => number;
+    /** Whether `revokeAdminSessions(adminId)` ran after `mark` was taken. */
+    adminRevokedSince: (adminId: string, mark: number) => boolean;
     clearAuthCookies: (reply: FastifyReply) => void;
   }
 }

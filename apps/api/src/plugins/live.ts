@@ -32,6 +32,19 @@ import {
 } from '../modules/live/socket-guards.js';
 import { allowedOrigins } from './csrf.js';
 
+/**
+ * What a `/presenter` handshake leaves on `socket.data` for its `connection` handler (and for
+ * revokeAdminSessions' sweep, which matches on `adminId`).
+ */
+export interface PresenterSocketData {
+  adminId: string;
+  /** `app.revocationMark()` taken before the token was verified. */
+  revocationMark: number;
+  sessionId: string;
+  /** Whether the snapshot sent during the handshake already showed the session ENDED. */
+  snapshotEnded: boolean;
+}
+
 /** socket.io middleware refusal carrying a machine-readable code in `err.data`. */
 function socketError(code: string, message: string): Error & { data: { code: string } } {
   return Object.assign(new Error(message), { data: { code } });
@@ -74,6 +87,15 @@ export const livePlugin = fp(
     const manager = new SessionManager(io, app.prisma, () => app.config.PUBLIC_URL, app.log);
     app.decorate('sessionManager', manager);
     manager.loadAllOpen().catch((err: unknown) => app.log.error({ err }, 'boot-time session load failed'));
+
+    /**
+     * The session state a presenter handshake loaded, handed to its `connection` handler (and then
+     * dropped): an end or a delete during the handshake marks that very object ENDED, with its reason.
+     */
+    const handshakeSessions = new WeakMap<
+      Socket,
+      NonNullable<Awaited<ReturnType<SessionManager['getOrLoad']>>>
+    >();
 
     // Graceful shutdown: disconnect everyone gently.
     app.addHook('onClose', async () => {
@@ -250,6 +272,8 @@ export const livePlugin = fp(
       const attach = PresenterAttachAuth.safeParse(socket.handshake.auth ?? {});
       if (!attach.success) return next(socketError('SESSION_NOT_FOUND', 'Session inconnue'));
       const { sessionId } = attach.data;
+      // Before the verify: a revocation landing anywhere after this line is seen on `connection`.
+      const revocationMark = app.revocationMark();
       try {
         // Same check as the REST guard: signature/alg/iss/aud/exp, logout, inactive account and
         // credential version (a password change refuses every earlier token).
@@ -262,7 +286,6 @@ export const livePlugin = fp(
           );
         }
         const { adminId } = check;
-        (socket.data as { adminId: string }).adminId = adminId;
         // Ownership from the row first: a non-owner must not be able to pull a session into memory.
         const row = await app.prisma.liveSession.findUnique({
           where: { id: sessionId },
@@ -276,8 +299,24 @@ export const livePlugin = fp(
         const s = await manager.getOrLoad(sessionId);
         if (!s) return next(socketError('SESSION_NOT_FOUND', 'Session inconnue'));
         socket.join(presenterRoom(sessionId));
-        (socket.data as { sessionId?: string }).sessionId = sessionId;
-        socket.emit('state:snapshot', await manager.presenterSnapshot(s));
+        const snapshot = await manager.presenterSnapshot(s);
+        // Revoked during the awaits above (the sweep could not see this socket yet): refused before
+        // the snapshot leaves, with the code the client refreshes on. socket.io leaves the room on a
+        // middleware error.
+        if (app.adminRevokedSince(adminId, revocationMark)) {
+          return next(socketError('UNAUTHORIZED', 'Non authentifié'));
+        }
+        // `snapshotEnded`: the phase this snapshot shows — an end landing after it, before
+        // registration, is replayed on `connection`.
+        handshakeSessions.set(socket, s);
+        const data: PresenterSocketData = {
+          adminId,
+          revocationMark,
+          sessionId,
+          snapshotEnded: snapshot.phase === 'ENDED',
+        };
+        Object.assign(socket.data as PresenterSocketData, data);
+        socket.emit('state:snapshot', snapshot);
         next();
       } catch (err) {
         app.log.error({ err }, 'presenter handshake failed');
@@ -286,7 +325,18 @@ export const livePlugin = fp(
     });
 
     io.of('/presenter').on('connection', (socket: Socket) => {
-      const getSession = () => manager.getOrLoad((socket.data as { sessionId?: string }).sessionId ?? '');
+      const data = socket.data as PresenterSocketData;
+      const loaded = handshakeSessions.get(socket);
+      handshakeSessions.delete(socket);
+      // socket.io registers the socket in `nsp.sockets` (and in its rooms' broadcasts) only a tick
+      // after the handshake's `next()`: what targeted it during that tick missed it. First, a
+      // password change or deactivation whose sweep ran meanwhile: closed the way the sweep closes
+      // one, before a single command handler is wired.
+      if (!loaded || app.adminRevokedSince(data.adminId, data.revocationMark)) {
+        socket.disconnect(true);
+        return;
+      }
+      const getSession = () => manager.getOrLoad(data.sessionId);
       socket.on('disconnect', () => commandLimiter.release(socket.id));
 
       /** A presenter command: rate-limited per socket (§6.7) before anything else runs. */
@@ -362,6 +412,9 @@ export const livePlugin = fp(
         const settings = await manager.updateSettings(s, parsed.data);
         ackOk(ack, { settings });
       });
+
+      // Then an end (or a delete) that the room broadcast could not deliver yet.
+      manager.settlePresenter(socket, loaded, data.snapshotEnded);
     });
   },
   { name: 'live' },

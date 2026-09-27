@@ -1157,6 +1157,22 @@ export class SessionManager {
   }
 
   /**
+   * Called on `connection` for a presenter socket, the presenter-side twin of `settleResumed`. The
+   * handshake joined the presenter room before its snapshot, but socket.io skips a socket still in
+   * its handshake on a room broadcast: an end or a delete landing after the snapshot was built never
+   * reached it, and the stage would keep showing a live session. Replayed here. The presenter stays
+   * connected (its end screen), as after the regular `session:ended`. `loaded`: the state the
+   * handshake got from `getOrLoad` — an end, a delete or an idle shutdown marks that very object
+   * ENDED (a purge or delete only forgets it afterwards), so its `startedAt` still tells CANCELLED from
+   * ENDED. `snapshotEnded`: the handshake's snapshot already showed the end, nothing to replay.
+   */
+  settlePresenter(socket: Socket, loaded: LiveSessionState, snapshotEnded: boolean): void {
+    if (!snapshotEnded && loaded.phase === 'ENDED') {
+      socket.emit('session:ended', { reason: endedReason(loaded) });
+    }
+  }
+
+  /**
    * App shutdown: no close, retry or idle timer may fire against a closed database afterwards, nor
    * re-arm itself there.
    */

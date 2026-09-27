@@ -31,9 +31,15 @@ import { JWT_AUDIENCE, JWT_ISSUER, REFRESH_ROTATION_GRACE_MS } from '../src/plug
 import { allowedOrigins } from '../src/plugins/csrf.js';
 import { sha256 } from '../src/lib/api.js';
 import { SessionManager } from '../src/modules/live/SessionManager.js';
+import type { PresenterSocketData } from '../src/plugins/live.js';
 import type { FastifyInstance } from 'fastify';
 import type { Socket } from 'socket.io';
-import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
+import {
+  io as ioClient,
+  type ManagerOptions,
+  type Socket as ClientSocket,
+  type SocketOptions,
+} from 'socket.io-client';
 
 const TEST_EMAIL = 'test-admin@example.fr';
 const TEST_PASSWORD = 'test-password-12';
@@ -1545,18 +1551,19 @@ describe('live engine', () => {
     ...extra,
   });
 
-  async function createQuiz(title: string, questions: QuestionPayload[]) {
+  /** `as`: the session cookie of the owning admin, the test admin by default. */
+  async function createQuiz(title: string, questions: QuestionPayload[], as = cookies) {
     const created = await app.inject({
       method: 'POST',
       url: '/api/v1/quizzes',
-      cookies: cookiesObject(cookies),
+      cookies: cookiesObject(as),
       payload: { title, description: null },
     });
     const id = created.json().quiz.id as string;
     const put = await app.inject({
       method: 'PUT',
       url: `/api/v1/quizzes/${id}/questions`,
-      cookies: cookiesObject(cookies),
+      cookies: cookiesObject(as),
       payload: { questions },
     });
     expect(put.statusCode).toBe(200);
@@ -1568,11 +1575,11 @@ describe('live engine', () => {
     };
   }
 
-  async function createLiveSession(quiz: string) {
+  async function createLiveSession(quiz: string, as = cookies) {
     const res = await app.inject({
       method: 'POST',
       url: `/api/v1/quizzes/${quiz}/sessions`,
-      cookies: cookiesObject(cookies),
+      cookies: cookiesObject(as),
       payload: {},
     });
     const { sessionId, code } = res.json() as { sessionId: string; code: string };
@@ -2874,23 +2881,27 @@ describe('live engine', () => {
       }
     });
 
-    /** A participant socket (resuming `token` if given), with the client's default auto-reconnect left on. */
-    const connectedPhone = async (token?: string) => {
-      const socket = ioClient(`${base}/participant`, {
-        transports: ['websocket'],
-        forceNew: true,
-        auth: token ? { token } : {},
-      });
+    /** A connected socket on `nsp`, recording every event it receives. */
+    const connectedSocket = async (nsp: string, opts: Partial<ManagerOptions & SocketOptions>) => {
+      const socket = ioClient(`${base}${nsp}`, { transports: ['websocket'], forceNew: true, ...opts });
       opened.push(socket);
       const received: string[] = [];
-      socket.onAny((event: string) => received.push(event));
+      const payloads: Array<[event: string, payload: unknown]> = [];
+      socket.onAny((event: string, payload: unknown) => {
+        received.push(event);
+        payloads.push([event, payload]);
+      });
       const disconnected = new Promise<string>((resolve) => socket.once('disconnect', resolve));
       await new Promise<void>((resolve, reject) => {
         socket.once('connect', () => resolve());
         socket.once('connect_error', reject);
       });
-      return { socket, received, disconnected };
+      return { socket, received, payloads, disconnected };
     };
+
+    /** A participant socket (resuming `token` if given), with the client's default auto-reconnect left on. */
+    const connectedPhone = (token?: string) =>
+      connectedSocket('/participant', { auth: token ? { token } : {} });
 
     /** A participant socket, joined to `code`. */
     const joinedPhone = async (code: string, nickname: string) => {
@@ -3134,6 +3145,156 @@ describe('live engine', () => {
       });
       expect(logout.statusCode).toBe(204);
       expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('UNAUTHORIZED');
+    });
+
+    /** A presenter socket attached to `sessionId`, without auto-reconnect. */
+    const connectedStage = (sessionId: string, cookie: string) =>
+      connectedSocket('/presenter', { reconnection: false, extraHeaders: { cookie }, auth: { sessionId } });
+
+    /** A second, active admin signed in from its own address, owning a fresh lobby session. */
+    const revocableAdmin = async (remoteAddress: string) => {
+      const email = 'revoked-during-handshake@example.fr';
+      const admin = await app.prisma.admin.upsert({
+        where: { email },
+        update: { isActive: true },
+        create: { email, displayName: 'Révoqué', passwordHash: await hash(TEST_PASSWORD) },
+      });
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/v1/auth/login',
+        remoteAddress,
+        payload: { email, password: TEST_PASSWORD },
+      });
+      expect(login.statusCode).toBe(200);
+      const theirs = setCookieOf(login);
+      const quiz = await createQuiz('Quiz révocation pendant la poignée de main', [mcq()], theirs);
+      const { sessionId, s } = await createLiveSession(quiz.id, theirs);
+      return { admin, theirs, sessionId, s };
+    };
+
+    const presenterSocketsOf = (adminId: string) =>
+      [...app.io.of('/presenter').sockets.values()].filter(
+        (sock) => (sock.data as Partial<PresenterSocketData>).adminId === adminId,
+      );
+
+    it('refuses a presenter whose admin is deactivated while its handshake builds the snapshot', async () => {
+      const { admin, theirs, sessionId, s } = await revocableAdmin('203.0.113.78');
+      // The token verified, ownership read and the session loaded: the deactivation (and its socket
+      // sweep) lands while `nsp.sockets` does not hold this socket yet.
+      const manager = app.sessionManager;
+      const original = manager.presenterSnapshot.bind(manager);
+      const spy = vi.spyOn(manager, 'presenterSnapshot').mockImplementationOnce(async (st) => {
+        const patch = await app.inject({
+          method: 'PATCH',
+          url: `/api/v1/admins/${admin.id}`,
+          cookies: cookiesObject(cookies),
+          payload: { isActive: false },
+        });
+        expect(patch.statusCode).toBe(200);
+        return original(st);
+      });
+      const stage = ioClient(`${base}/presenter`, {
+        transports: ['websocket'],
+        forceNew: true,
+        reconnection: false,
+        extraHeaders: { cookie: theirs },
+        auth: { sessionId },
+      });
+      opened.push(stage);
+      const received: string[] = [];
+      stage.onAny((event: string) => received.push(event));
+      try {
+        // Refused in the middleware with the code the client refreshes on, before the snapshot leaves.
+        const refusal = await new Promise<string | undefined>((resolve) => {
+          stage.once('connect', () => resolve('connected'));
+          stage.once('connect_error', (err: Error & { data?: { code?: string } }) => resolve(err.data?.code));
+        });
+        expect(refusal).toBe('UNAUTHORIZED');
+        expect(received).not.toContain('state:snapshot');
+        expect(presenterSocketsOf(admin.id)).toEqual([]);
+      } finally {
+        spy.mockRestore();
+        await manager.endSession(s);
+        await app.prisma.admin.update({ where: { id: admin.id }, data: { isActive: true } });
+      }
+    });
+
+    it('drops a presenter whose admin is revoked between its handshake and its registration', async () => {
+      const { admin, theirs, sessionId, s } = await revocableAdmin('203.0.113.79');
+      const manager = app.sessionManager;
+      const original = manager.presenterSnapshot.bind(manager);
+      // Queued before socket.io's own nextTick for `_doConnect`: the revocation (stamp and sweep)
+      // runs after the middleware's last check and its `next()`, before the socket is registered.
+      const spy = vi.spyOn(manager, 'presenterSnapshot').mockImplementationOnce(async (st) => {
+        const snapshot = await original(st);
+        process.nextTick(() => void app.revokeAdminSessions(admin.id));
+        return snapshot;
+      });
+      try {
+        const stage = await connectedStage(sessionId, theirs);
+        // Closed the way the sweep closes one (`disconnect(true)`: DISCONNECT packet, then the transport).
+        expect(await stage.disconnected).toBe('io server disconnect');
+        await vi.waitFor(() => expect(presenterSocketsOf(admin.id)).toEqual([]));
+      } finally {
+        spy.mockRestore();
+        await manager.endSession(s);
+      }
+    });
+
+    it('tells a presenter about a session that ended while its handshake built the snapshot', async () => {
+      const quiz = await createQuiz('Quiz fin pendant la poignée de main', [mcq()]);
+      const { sessionId, s } = await createLiveSession(quiz.id);
+      const manager = app.sessionManager;
+      const original = manager.presenterSnapshot.bind(manager);
+      // The snapshot shows the lobby; the end commits after it, before the handshake's `next()`, so
+      // the room broadcast of `session:ended` skips this not-yet-connected socket.
+      const spy = vi.spyOn(manager, 'presenterSnapshot').mockImplementationOnce(async (st) => {
+        const snapshot = await original(st);
+        await manager.endSession(s);
+        return snapshot;
+      });
+      try {
+        const stage = await connectedStage(sessionId, cookies);
+        await vi.waitFor(() => expect(stage.received).toContain('session:ended'));
+        expect(stage.socket.connected).toBe(true); // presenters keep their end screen
+        stage.socket.close();
+      } finally {
+        spy.mockRestore();
+        await manager.endSession(s); // idempotent: only matters when the spy never ran
+      }
+    });
+
+    it('tells a presenter CANCELLED for a lobby session deleted while its handshake built the snapshot', async () => {
+      const quiz = await createQuiz('Quiz supprimé pendant la poignée de main', [mcq()]);
+      const { sessionId } = await createLiveSession(quiz.id);
+      const manager = app.sessionManager;
+      const original = manager.presenterSnapshot.bind(manager);
+      const spy = vi.spyOn(manager, 'presenterSnapshot').mockImplementationOnce(async (st) => {
+        const snapshot = await original(st);
+        await manager.deleteSession(sessionId); // never started: its room was told CANCELLED
+        return snapshot;
+      });
+      try {
+        const stage = await connectedStage(sessionId, cookies);
+        await vi.waitFor(() => expect(stage.received).toContain('session:ended'));
+        expect(stage.payloads).toContainEqual(['session:ended', { reason: 'CANCELLED' }]);
+        stage.socket.close();
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it('does not replay the end to a presenter attaching to a session already ended', async () => {
+      const quiz = await createQuiz('Quiz déjà terminé', [mcq()]);
+      const { sessionId, s } = await createLiveSession(quiz.id);
+      await app.sessionManager.endSession(s);
+      const stage = await connectedStage(sessionId, cookies);
+      // A replay is emitted in the `connection` handler, before any command is handled: once a
+      // command's ack is back, it would already have arrived.
+      await stage.socket.timeout(2000).emitWithAck('settings:update', {});
+      expect(stage.received).toContain('state:snapshot');
+      expect(stage.received).not.toContain('session:ended');
+      stage.socket.close();
     });
   });
 });
