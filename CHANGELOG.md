@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.2 (2026-09-27)
 
 Account roles. One new migration (`20260927160759_account_roles`): every existing account, deactivated ones included, becomes `ADMIN`; demote the ones that should be `USER` after deploy.
 
