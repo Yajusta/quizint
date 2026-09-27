@@ -76,6 +76,7 @@ export const livePlugin = fp(
 
     // Graceful shutdown: disconnect everyone gently.
     app.addHook('onClose', async () => {
+      manager.stop();
       await new Promise<void>((resolve) => io.close(() => resolve()));
     });
 
@@ -217,6 +218,9 @@ export const livePlugin = fp(
           })
           .catch((err: unknown) => app.log.error({ err }, 'disconnect bookkeeping failed'));
       });
+
+      // Last, once `disconnect` is wired: a resume ended, kicked or replaced during its handshake.
+      manager.settleResumed(socket);
     });
 
     // ---------------- /presenter namespace ----------------

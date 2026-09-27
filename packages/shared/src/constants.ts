@@ -97,6 +97,13 @@ export const NUMERIC_BUCKETS = 12;
 
 export const SESSION_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1000; // 6 h without a join, answer or presenter command
 export const ENDED_PURGE_DELAY_MS = 60 * 1000;
+/**
+ * Auto-close whose write failed: retried after BASE, doubled on each failure up to MAX, until it
+ * commits or a manual close, a step, an end or a delete cancels it. Never given up: a timed question
+ * must not stay open for good because the disk hiccuped once.
+ */
+export const AUTO_CLOSE_RETRY_BASE_MS = 1000;
+export const AUTO_CLOSE_RETRY_MAX_MS = 30 * 1000;
 
 export const CLOCK_SYNC_SAMPLES = 5;
 

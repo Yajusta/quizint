@@ -42,6 +42,8 @@ import {
   PARTICIPANT_TOKEN_BYTES,
   MAX_PARTICIPANTS_PER_SESSION,
   ENDED_PURGE_DELAY_MS,
+  AUTO_CLOSE_RETRY_BASE_MS,
+  AUTO_CLOSE_RETRY_MAX_MS,
 } from '@quiz/shared';
 
 interface ParticipantState {
@@ -114,6 +116,14 @@ function transportGone(socket: Socket): boolean {
   return socket.conn.readyState !== 'open';
 }
 
+/**
+ * The `session:ended` reason: CANCELLED for a session that never started. A session already gone
+ * from memory (deleted, or purged after its end) no longer says, and reads as ENDED.
+ */
+function endedReason(s: { startedAt: number | null } | undefined): 'ENDED' | 'CANCELLED' {
+  return s && s.startedAt === null ? 'CANCELLED' : 'ENDED';
+}
+
 /** Prisma unique-constraint violation (P2002). */
 function isUniqueViolation(err: unknown): boolean {
   return typeof err === 'object' && err !== null && (err as { code?: unknown }).code === 'P2002';
@@ -134,6 +144,8 @@ export class SessionManager {
   private readonly visibleRankingCache = new Map<string, RankingRow[]>();
   /** Sessions being deleted: `getOrLoad` must not rebuild one from a row about to disappear. */
   private readonly deleting = new Set<string>();
+  /** Set by `stop()` on app close: no timer is armed any more. */
+  private stopped = false;
 
   constructor(
     private readonly io: SocketIOServer,
@@ -412,6 +424,9 @@ export class SessionManager {
       if (!participant) return { ok: false, code: 'TOKEN_INVALID', message: 'Session expirée' } as const;
       if (participant.isKicked)
         return { ok: false, code: 'KICKED', message: 'Vous avez été retiré de la session' } as const;
+      // Ended while this resume awaited the lock: the eviction has run, joining the room now would
+      // leave this socket connected to a finished session.
+      if (s.phase === 'ENDED') return refuse('SESSION_ENDED');
 
       // Single active connection per participant: the new one replaces the old.
       const previousSocketId = participant.socketId;
@@ -419,7 +434,10 @@ export class SessionManager {
         const previous = this.participantNs().sockets.get(previousSocketId);
         if (previous) {
           previous.emit('participant:replaced');
-          previous.disconnect(true);
+          // A namespace disconnect, not a transport close: socket.io-client never auto-reconnects
+          // after `io server disconnect`. After a transport close, two tabs holding the same token
+          // would take the seat back from each other on every reconnect, for good.
+          previous.disconnect();
         }
       }
       participant.connected = true;
@@ -720,14 +738,34 @@ export class SessionManager {
     });
   }
 
-  /** Stops the hot state (timer, phase) and tells both audiences. Mutex held. */
+  /**
+   * Stops the hot state (timer, phase), tells both audiences, then evicts the participants' sockets.
+   * Mutex held, called once the end (or the delete) is committed.
+   *
+   * The eviction frees the per-IP socket slots and the memory a finished session would otherwise
+   * hold until every phone closes its tab. It is a namespace disconnect, not a transport close: the
+   * phone receives `session:ended` then a DISCONNECT packet on the same, ordered connection, and a
+   * socket.io client never auto-reconnects after `io server disconnect` — it stays on its ended
+   * screen instead of looping on refused handshakes. Presenters stay connected (their end screen).
+   */
   private shutdown(s: LiveSessionState): void {
     this.clearCloseTimer(s);
     this.clearIdleTimer(s);
     s.phase = 'ENDED';
-    const reason = s.startedAt !== null ? 'ENDED' : 'CANCELLED';
+    const reason = endedReason(s);
     this.presenterNs().to(presenterRoom(s.sessionId)).emit('session:ended', { reason });
     this.participantNs().to(participantsRoom(s.sessionId)).emit('session:ended', { reason });
+    // Presence first, in one go: each evicted socket's `disconnect` handler then finds its seat
+    // already released and does not re-broadcast the participants list once per phone.
+    let wasOnline = false;
+    for (const p of s.participants.values()) {
+      if (!p.connected) continue;
+      wasOnline = true;
+      p.connected = false;
+      p.socketId = null;
+    }
+    if (wasOnline) this.broadcastParticipantsList(s);
+    this.participantNs().in(participantsRoom(s.sessionId)).disconnectSockets();
   }
 
   /** Drops a session's hot state; the next getOrLoad reads it back from the database. */
@@ -750,6 +788,7 @@ export class SessionManager {
    */
   private armIdleTimer(s: LiveSessionState): void {
     this.clearIdleTimer(s);
+    if (this.stopped) return;
     s.idleTimer = setTimeout(() => {
       s.idleTimer = null;
       if (this.sessions.get(s.sessionId) !== s || s.phase === 'ENDED') return;
@@ -826,22 +865,46 @@ export class SessionManager {
     s.timer = null;
   }
 
-  private armCloseTimer(s: LiveSessionState, delayMs: number): void {
+  /**
+   * A failed write re-arms a retry on `s.timer` (capped exponential backoff), still for that same
+   * opening: whatever cancels the auto-close (a manual close, a step back, a next or reopen, an end, a
+   * delete — all through `clearCloseTimer` or `armCloseTimer`) cancels the pending retry too.
+   */
+  private armCloseTimer(s: LiveSessionState, delayMs: number, attempt = 0): void {
     this.clearCloseTimer(s);
+    if (this.stopped) return;
     const index = s.currentQuestionIndex;
     const openedAt = s.questionOpenedAt;
+    const sameOpening = () =>
+      s.phase === 'QUESTION_OPEN' && s.currentQuestionIndex === index && s.questionOpenedAt === openedAt;
     s.timer = setTimeout(
       () => {
         s.mutex
           .runExclusive(async () => {
-            if (s.currentQuestionIndex === index && s.questionOpenedAt === openedAt) {
+            // Stopped: fired just before the app closed, and waited for the lock through the close.
+            if (!sameOpening() || this.stopped) return;
+            try {
               await this.closeQuestion(s);
+            } catch (err) {
+              // Still under the lock: nothing else can close, step or end in between. closeQuestion
+              // mutates nothing before its commit, so a failed write leaves the question as it was; a throw
+              // after the commit (the broadcasts) has closed it, hence the re-check before re-arming.
+              const context = { err, sessionId: s.sessionId, questionIndex: index, attempt };
+              if (!sameOpening() || this.stopped) {
+                this.log.error(context, 'auto-close failed, no retry');
+                return;
+              }
+              const retryMs = Math.min(AUTO_CLOSE_RETRY_BASE_MS * 2 ** attempt, AUTO_CLOSE_RETRY_MAX_MS);
+              this.log.error({ ...context, retryMs }, 'auto-close failed, retry armed');
+              this.armCloseTimer(s, retryMs, attempt + 1);
             }
           })
           .catch((err: unknown) => this.log.error({ err, sessionId: s.sessionId }, 'auto-close failed'));
       },
       Math.max(0, delayMs),
     );
+    // The HTTP server keeps the process alive while it serves; a pending (re)try alone must not.
+    s.timer.unref?.();
   }
 
   /**
@@ -1064,6 +1127,47 @@ export class SessionManager {
   }
 
   // --- Presence & broadcasts ---------------------------------------------------------
+
+  /**
+   * Called on `connection` for a resumed socket. socket.io only registers a socket in its namespace
+   * a tick after the handshake's `next()`, and the resume released the lock before the snapshot was
+   * even built: the terminal outcomes that targeted this socket in that gap — an end or a delete
+   * (room broadcast and eviction), a kick, a newer resume replacing it (`sockets.get` by id) — could
+   * not reach it yet, so they are replayed here. Plain room broadcasts sent in that gap (a phase
+   * change) are not: the next event or resume brings the phone back in step.
+   */
+  settleResumed(socket: Socket): void {
+    const { sessionId, participantId } = socket.data as { sessionId?: string; participantId?: string };
+    if (!sessionId || !participantId) return; // anonymous: joins later, under the lock
+    const s = this.sessions.get(sessionId);
+    // Absent: deleted, or purged after its end — a live session stays loaded once resumed into.
+    if (!s || s.phase === 'ENDED') {
+      socket.emit('session:ended', { reason: endedReason(s) });
+      socket.disconnect();
+      return;
+    }
+    const p = s.participants.get(participantId);
+    if (p?.isKicked) {
+      socket.emit('participant:kicked', { message: errorMessage('KICKED') });
+      socket.disconnect(true);
+    } else if (p?.socketId !== socket.id) {
+      socket.emit('participant:replaced');
+      socket.disconnect(); // namespace disconnect, as in resumeByToken's replace
+    }
+  }
+
+  /**
+   * App shutdown: no close, retry or idle timer may fire against a closed database afterwards, nor
+   * re-arm itself there.
+   */
+  stop(): void {
+    this.stopped = true;
+    for (const s of this.sessions.values()) {
+      this.clearCloseTimer(s);
+      this.clearIdleTimer(s);
+    }
+    for (const progress of this.progress.values()) if (progress.trailing) clearTimeout(progress.trailing);
+  }
 
   /** `socketId` is the socket that closed: a socket already replaced by a resume changes nothing. */
   markDisconnected(s: LiveSessionState, participantId: string, socketId: string): void {

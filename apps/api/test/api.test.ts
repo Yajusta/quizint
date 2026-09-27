@@ -10,6 +10,7 @@ import { createHmac } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
+  AUTO_CLOSE_RETRY_BASE_MS,
   CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
   ENDED_PURGE_DELAY_MS,
   IMAGE_MAX_INPUT_PIXELS,
@@ -1585,9 +1586,9 @@ describe('live engine', () => {
     expect(results.find((r) => !r.ok)).toMatchObject({ ok: false, code: 'NICKNAME_TAKEN' });
   });
 
-  /** The last idle-eviction callback armed through the spied `setTimeout`. */
-  const lastIdleCallback = (spy: { mock: { calls: unknown[][] } }) => {
-    const armed = spy.mock.calls.filter((call) => call[1] === SESSION_IDLE_TIMEOUT_MS).at(-1);
+  /** The last callback armed through the spied `setTimeout` with that delay. */
+  const lastArmed = (spy: { mock: { calls: unknown[][] } }, delayMs: number) => {
+    const armed = spy.mock.calls.filter((call) => call[1] === delayMs).at(-1);
     expect(armed).toBeDefined();
     return armed![0] as () => void;
   };
@@ -1605,7 +1606,7 @@ describe('live engine', () => {
       expect(idle.idleTimer).not.toBe(armedAtLoad); // a join re-arms the timer
 
       // Fire the armed callback by hand instead of waiting six hours.
-      lastIdleCallback(spy)();
+      lastArmed(spy, SESSION_IDLE_TIMEOUT_MS)();
       await vi.waitFor(async () => {
         const row = await app.prisma.liveSession.findUniqueOrThrow({ where: { id: sessionId } });
         expect(row.phase).toBe('ENDED');
@@ -1633,7 +1634,7 @@ describe('live engine', () => {
       expect(idle.idleTimer).not.toBeNull();
 
       // The presenter closed the tab without ending the session.
-      lastIdleCallback(spy)();
+      lastArmed(spy, SESSION_IDLE_TIMEOUT_MS)();
       await vi.waitFor(async () => {
         const row = await app.prisma.liveSession.findUniqueOrThrow({ where: { id: sessionId } });
         expect(row.phase).toBe('ENDED');
@@ -2290,6 +2291,113 @@ describe('live engine', () => {
     expect(s.timer).toBeNull();
   });
 
+  /** A timed question open on `s`, its auto-close handed to a manager whose first close write fails. */
+  const failingAutoClose = async (title: string) => {
+    const quiz = await createQuiz(title, [mcq({ timeLimitSec: 30 })]);
+    const { code, s } = await createLiveSession(quiz.id);
+    await joinAs(code, 'Minuteur');
+    await app.sessionManager.startSession(s, false);
+    const $transaction = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('disk full'))
+      .mockImplementation((ops: Parameters<typeof app.prisma.$transaction>[0]) =>
+        app.prisma.$transaction(ops as never),
+      );
+    const failing = new SessionManager(
+      app.io,
+      prismaWith({ $transaction }),
+      () => 'http://localhost',
+      app.log,
+    );
+    const arm = (failing as unknown as { armCloseTimer: (st: typeof s, ms: number) => void }).armCloseTimer;
+    return { s, failing, $transaction, armNow: () => arm.call(failing, s, 0) };
+  };
+
+  /**
+   * Waits for the first write to fail and the retry to be armed on `s.timer`, then returns that
+   * retry's callback, matched by the timer it returned rather than by its delay (anything else in the
+   * process may arm a timer of the same duration).
+   */
+  const armedRetry = async (
+    s: { timer: unknown },
+    $transaction: { mock: { calls: unknown[] } },
+    spy: { mock: { calls: unknown[][]; results: { value: unknown }[] } },
+  ) => {
+    await vi.waitFor(() => {
+      expect($transaction.mock.calls).toHaveLength(1);
+      const at = spy.mock.results.findIndex((r) => r.value === s.timer);
+      expect(at).toBeGreaterThanOrEqual(0);
+      expect(spy.mock.calls[at]?.[1]).toBe(AUTO_CLOSE_RETRY_BASE_MS);
+    });
+    const at = spy.mock.results.findIndex((r) => r.value === s.timer);
+    return spy.mock.calls[at]![0] as () => void;
+  };
+
+  it('an auto-close whose write fails is retried until the question closes', async () => {
+    const { s, $transaction, armNow } = await failingAutoClose('Quiz auto-fermeture ratée');
+    const spy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      armNow(); // the time limit is over
+      const retry = await armedRetry(s, $transaction, spy);
+      expect(s.phase).toBe('QUESTION_OPEN'); // not closed, but not left without a timer either
+      retry(); // instead of waiting for the backoff
+      await vi.waitFor(() => expect(s.phase).toBe('QUESTION_CLOSED'));
+      expect($transaction).toHaveBeenCalledTimes(2);
+      expect(s.timer).toBeNull();
+    } finally {
+      spy.mockRestore();
+      await app.sessionManager.endSession(s);
+    }
+  });
+
+  it('stopping the manager (app close) cancels a pending auto-close retry', async () => {
+    const { s, failing, $transaction, armNow } = await failingAutoClose('Quiz retry arrêté');
+    const spy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      armNow();
+      const retry = await armedRetry(s, $transaction, spy);
+      // The manager must know the session for stop() to reach it: the test built `s` elsewhere.
+      (failing as unknown as { sessions: Map<string, typeof s> }).sessions.set(s.sessionId, s);
+      failing.stop();
+      expect(s.timer).toBeNull();
+      // A retry already queued does not write, and nothing re-arms after stop().
+      retry();
+      await s.mutex.waitForUnlock();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(s.timer).toBeNull();
+      expect(s.phase).toBe('QUESTION_OPEN');
+      expect($transaction).toHaveBeenCalledTimes(1);
+    } finally {
+      spy.mockRestore();
+      await app.sessionManager.endSession(s);
+    }
+  });
+
+  it('a manual close cancels a pending auto-close retry', async () => {
+    const { s, $transaction, armNow } = await failingAutoClose('Quiz retry annulé');
+    const spy = vi.spyOn(globalThis, 'setTimeout');
+    const clear = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      armNow();
+      const retry = await armedRetry(s, $transaction, spy);
+      const pending = s.timer;
+
+      expect(await app.sessionManager.closeQuestionCommand(s, 0)).toEqual({ ok: true });
+      expect(s.timer).toBeNull();
+      expect(clear).toHaveBeenCalledWith(pending);
+      // Even fired late, the stale retry writes nothing: that opening is closed already.
+      retry();
+      await s.mutex.waitForUnlock();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect($transaction).toHaveBeenCalledTimes(1);
+      expect(s.phase).toBe('QUESTION_CLOSED');
+    } finally {
+      spy.mockRestore();
+      clear.mockRestore();
+      await app.sessionManager.endSession(s);
+    }
+  });
+
   it('a media frozen in a session snapshot cannot be deleted until that session is gone', async () => {
     const boundary = 'vitest-boundary-snapshot';
     const gif = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
@@ -2545,6 +2653,162 @@ describe('live engine', () => {
         expect(await handshake('/', { origin: 'http://localhost:5173', transport })).toBe('NOT_FOUND');
         expect(await handshake('/participant', { transport })).toBe('connected');
       }
+    });
+
+    /** A participant socket (resuming `token` if given), with the client's default auto-reconnect left on. */
+    const connectedPhone = async (token?: string) => {
+      const socket = ioClient(`${base}/participant`, {
+        transports: ['websocket'],
+        forceNew: true,
+        auth: token ? { token } : {},
+      });
+      opened.push(socket);
+      const received: string[] = [];
+      socket.onAny((event: string) => received.push(event));
+      const disconnected = new Promise<string>((resolve) => socket.once('disconnect', resolve));
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', () => resolve());
+        socket.once('connect_error', reject);
+      });
+      return { socket, received, disconnected };
+    };
+
+    /** A participant socket, joined to `code`. */
+    const joinedPhone = async (code: string, nickname: string) => {
+      const phone = await connectedPhone();
+      const ack = (await phone.socket.timeout(5000).emitWithAck('participant:join', { code, nickname })) as {
+        ok: boolean;
+        token: string;
+      };
+      expect(ack.ok).toBe(true);
+      return { ...phone, token: ack.token };
+    };
+
+    /** A namespace disconnect, after `session:ended` on the same ordered connection, and no reconnect. */
+    const expectEvicted = async (phone: Awaited<ReturnType<typeof connectedPhone>>) => {
+      expect(await phone.disconnected).toBe('io server disconnect');
+      expect(phone.received).toContain('session:ended');
+      expect(phone.socket.active).toBe(false); // socket.io-client will not reconnect on its own
+    };
+
+    it('ending a session evicts the participants after the final event, with no reconnect loop', async () => {
+      const quiz = await createQuiz('Quiz éviction', [mcq()]);
+      const { sessionId, code, s } = await createLiveSession(quiz.id);
+      const phones = [await joinedPhone(code, 'Zoé'), await joinedPhone(code, 'Hugo')];
+      const room = app.io.of('/participant').adapter.rooms.get(`session:${sessionId}:participants`);
+      expect(room?.size).toBe(2);
+
+      await app.sessionManager.endSession(s);
+      for (const phone of phones) await expectEvicted(phone);
+      await vi.waitFor(() =>
+        expect(
+          app.io.of('/participant').adapter.rooms.get(`session:${sessionId}:participants`),
+        ).toBeUndefined(),
+      );
+      expect([...s.participants.values()].every((p) => !p.connected && p.socketId === null)).toBe(true);
+    });
+
+    it('deleting a running session evicts its participants too', async () => {
+      const quiz = await createQuiz('Quiz éviction suppression', [mcq()]);
+      const { sessionId, code } = await createLiveSession(quiz.id);
+      const phone = await joinedPhone(code, 'Inès');
+      const res = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/sessions/${sessionId}`,
+        cookies: cookiesObject(cookies),
+      });
+      expect(res.statusCode).toBe(204);
+      await expectEvicted(phone);
+    });
+
+    it('deleting a session that is still running (quiz delete path) evicts through its own shutdown', async () => {
+      const quiz = await createQuiz('Quiz éviction suppression directe', [mcq()]);
+      const { sessionId, code } = await createLiveSession(quiz.id);
+      const phone = await joinedPhone(code, 'Yanis');
+      await app.sessionManager.deleteSession(sessionId); // no endSession first, unlike the DELETE route
+      await expectEvicted(phone);
+    });
+
+    it('evicts a resume whose session ended while its handshake built the snapshot', async () => {
+      const quiz = await createQuiz('Quiz fin pendant la reprise', [mcq()]);
+      const { sessionId, code, s } = await createLiveSession(quiz.id);
+      const first = await joinedPhone(code, 'Lina');
+      first.socket.close();
+      await vi.waitFor(() => expect([...s.participants.values()][0]?.connected).toBe(false));
+
+      // The resume has passed its lock; the end commits before the handshake's `next()`, so its
+      // room broadcast and eviction cannot reach this not-yet-connected socket.
+      const manager = app.sessionManager;
+      const original = manager.participantSnapshot.bind(manager);
+      const spy = vi.spyOn(manager, 'participantSnapshot').mockImplementationOnce(async (st, p) => {
+        await manager.endSession(s);
+        return original(st, p);
+      });
+      try {
+        const phone = await connectedPhone(first.token);
+        await expectEvicted(phone);
+      } finally {
+        spy.mockRestore();
+      }
+      await vi.waitFor(() =>
+        expect(
+          app.io.of('/participant').adapter.rooms.get(`session:${sessionId}:participants`),
+        ).toBeUndefined(),
+      );
+    });
+
+    it('drops, for good, a resume replaced by a newer one while its handshake built the snapshot', async () => {
+      const quiz = await createQuiz('Quiz reprise remplacée', [mcq()]);
+      const { code, s } = await createLiveSession(quiz.id);
+      const first = await joinedPhone(code, 'Nora');
+      first.socket.close();
+      const participant = [...s.participants.values()][0]!;
+      await vi.waitFor(() => expect(participant.connected).toBe(false));
+
+      const manager = app.sessionManager;
+      const original = manager.participantSnapshot.bind(manager);
+      let newer: Awaited<ReturnType<typeof connectedPhone>> | undefined;
+      const spy = vi.spyOn(manager, 'participantSnapshot').mockImplementationOnce(async (st, p) => {
+        newer = await connectedPhone(first.token); // another tab, same token
+        return original(st, p);
+      });
+      try {
+        const older = await connectedPhone(first.token);
+        expect(await older.disconnected).toBe('io server disconnect');
+        expect(older.received).toContain('participant:replaced');
+        expect(older.socket.active).toBe(false); // no reconnect, so no seat ping-pong
+        expect(newer?.socket.connected).toBe(true);
+        expect(participant.socketId).toBe(newer?.socket.id);
+      } finally {
+        spy.mockRestore();
+        await manager.endSession(s);
+      }
+    });
+
+    it('drops a resume kicked while its handshake built the snapshot', async () => {
+      const quiz = await createQuiz('Quiz exclusion pendant la reprise', [mcq()]);
+      const { code, s } = await createLiveSession(quiz.id);
+      const first = await joinedPhone(code, 'Malo');
+      first.socket.close();
+      const participant = [...s.participants.values()][0]!;
+      await vi.waitFor(() => expect(participant.connected).toBe(false));
+
+      const manager = app.sessionManager;
+      const original = manager.participantSnapshot.bind(manager);
+      const spy = vi.spyOn(manager, 'participantSnapshot').mockImplementationOnce(async (st, p) => {
+        await manager.kick(s, participant.id);
+        return original(st, p);
+      });
+      try {
+        const phone = await connectedPhone(first.token);
+        await phone.disconnected;
+        expect(phone.received).toContain('participant:kicked');
+        phone.socket.close(); // a transport close would let the client retry: the refusal is covered elsewhere
+      } finally {
+        spy.mockRestore();
+      }
+      await vi.waitFor(() => expect(participant.connected).toBe(false));
+      await manager.endSession(s);
     });
 
     it('refuses a malformed resume token', async () => {

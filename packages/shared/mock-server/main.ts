@@ -884,6 +884,8 @@ presenterNs.on('connection', (socket: Socket) => {
     const reason = session.startedAt ? 'ENDED' : 'CANCELLED';
     presenterNs.to(presenterRoom(session.id)).emit('session:ended', { reason });
     participantNs.to(participantsRoom(session.id)).emit('session:ended', { reason });
+    // Like the API's shutdown: a namespace disconnect after the final event, no auto-reconnect.
+    participantNs.in(participantsRoom(session.id)).disconnectSockets();
     ack?.({ ok: true });
   });
 
