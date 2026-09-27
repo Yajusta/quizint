@@ -317,6 +317,8 @@ export interface Draft {
   description: string;
   questions: EditorQuestion[];
   at: number;
+  /** Id of the admin who wrote it, as confirmed by `/auth/me`. */
+  author: string;
 }
 
 const DRAFT_PREFIX = 'quiz:draft:';
@@ -325,30 +327,38 @@ export function draftKey(quizId: string | null): string {
   return `${DRAFT_PREFIX}${quizId ?? 'new'}`;
 }
 
-export function readDraft(key: string): Draft | null {
+/**
+ * Reads the draft stored under `key` for `adminId`. A draft carries the correct answers and the
+ * browser may be shared (projection PC): one written by another admin — or by nobody known, a
+ * legacy draft — is never returned, and is removed on the spot. So is a malformed or expired one.
+ */
+export function readDraft(key: string, adminId: string): Draft | null {
   try {
     const raw = localStorage.getItem(key);
     if (!raw) return null;
-    const draft = JSON.parse(raw) as Partial<Draft>;
+    const draft = JSON.parse(raw) as Partial<Draft> | null;
     if (
+      !draft ||
       typeof draft.title !== 'string' ||
       typeof draft.description !== 'string' ||
       !Array.isArray(draft.questions) ||
       typeof draft.at !== 'number' ||
-      Date.now() - draft.at > DRAFT_TTL_MS
+      Date.now() - draft.at > DRAFT_TTL_MS ||
+      draft.author !== adminId
     ) {
       localStorage.removeItem(key);
       return null;
     }
     return draft as Draft;
   } catch {
+    clearDraft(key);
     return null;
   }
 }
 
-export function writeDraft(key: string, draft: Omit<Draft, 'at'>): void {
+export function writeDraft(key: string, adminId: string, draft: Omit<Draft, 'at' | 'author'>): void {
   try {
-    localStorage.setItem(key, JSON.stringify({ ...draft, at: Date.now() }));
+    localStorage.setItem(key, JSON.stringify({ ...draft, at: Date.now(), author: adminId }));
   } catch {
     // storage full or unavailable — the draft is a safety net, not a feature
   }
@@ -364,7 +374,9 @@ export function clearDraft(key: string): void {
 
 /**
  * Drops every local draft. Called on logout: a draft carries the correct answers, and on a shared
- * projection PC the next admin to sign in must not find the previous one's work in storage.
+ * projection PC the next admin to sign in must not find the previous one's work in storage. A
+ * session that ends otherwise (expiry, deactivation, password change) keeps its drafts; `readDraft`
+ * then only hands them back to the admin who wrote them.
  */
 export function clearAllDrafts(): void {
   try {

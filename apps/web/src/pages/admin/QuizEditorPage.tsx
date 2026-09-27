@@ -17,7 +17,7 @@ import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { useMediaQuery } from '../../lib/useMediaQuery.ts';
 import { Button, Card, Dialog, EmptyState, Icon, Tabs } from '../../design-system/index.ts';
 import { ListSkeleton } from '../../components/Skeletons.tsx';
-import { redirectIfUnauthorized } from '../../lib/admin-identity.ts';
+import { fetchMeId, redirectIfUnauthorized } from '../../lib/admin-identity.ts';
 import { AdminLayout, ErrorAlert } from './AdminLayout.tsx';
 import { EditorHeader, type EditorState } from './editor/EditorHeader.tsx';
 import { QuestionList } from './editor/QuestionList.tsx';
@@ -51,6 +51,17 @@ const QuizDetailSchema = z.object({
 
 const QuestionsResponse = z.object({ quiz: z.object({ questions: z.array(QuestionDTO) }) });
 
+/**
+ * Admin the local draft belongs to. A 401 propagates (the caller sends back to the login); any other
+ * failure gives `null`: the editor still opens, but reads and writes no draft.
+ */
+function fetchDraftOwner(): Promise<string | null> {
+  return fetchMeId().catch((e: unknown) => {
+    if (e instanceof ApiErrorThrown && e.status === 401) throw e;
+    return null;
+  });
+}
+
 /** What the server currently holds — the dirty flag is « current ≠ baseline ». */
 interface Baseline {
   title: string;
@@ -78,7 +89,7 @@ export function QuizEditorPage() {
   const wide = useMediaQuery(WIDE_QUERY);
 
   const [quizId, setQuizId] = useState<string | null>(id ?? null);
-  const [loading, setLoading] = useState(!isNew);
+  const [loading, setLoading] = useState(true);
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
   const [descriptionCollapsed, setDescriptionCollapsed] = useState(false);
@@ -88,6 +99,8 @@ export function QuizEditorPage() {
   const [isLocked, setIsLocked] = useState(false);
   const [baseline, setBaseline] = useState<Baseline>({ title: '', description: '', questions: '[]' });
   const [draftRestored, setDraftRestored] = useState(false);
+  /** Admin the local draft belongs to (`/auth/me`); `null` until confirmed — no draft is written then. */
+  const [draftOwner, setDraftOwner] = useState<string | null>(null);
   const [error, setError] = useState<EditorError | null>(null);
   const [saving, setSaving] = useState(false);
   const [launching, setLaunching] = useState(false);
@@ -131,30 +144,43 @@ export function QuizEditorPage() {
     setTouched(new Set());
     setDraftRestored(false);
     setRightTab('settings');
+    setLoading(true);
+    // Drafts are bound to the admin the server confirms: nothing is restored before that answer,
+    // and a draft left by another admin on this browser is dropped, never shown.
     if (isNew) {
       setDescriptionCollapsed(false);
       setSettings(QuizSettings.parse({}));
       setIsLocked(false);
       setBaseline({ title: '', description: '', questions: '[]' });
-      const draft = readDraft(key);
-      const qs = draft && (draft.title || draft.questions.length > 0) ? draft.questions : [];
-      setTitle(draft?.title ?? '');
-      setDescription(draft?.description ?? '');
-      setQuestions(qs);
-      setSelectedKey(qs[0]?.key ?? null);
-      setDraftRestored(qs.length > 0 || Boolean(draft?.title));
-      setLoading(false);
-      return;
+      fetchDraftOwner().then(
+        (me) => {
+          if (!alive) return;
+          setDraftOwner(me);
+          const draft = me ? readDraft(key, me) : null;
+          const qs = draft && (draft.title || draft.questions.length > 0) ? draft.questions : [];
+          setTitle(draft?.title ?? '');
+          setDescription(draft?.description ?? '');
+          setQuestions(qs);
+          setSelectedKey(qs[0]?.key ?? null);
+          setDraftRestored(qs.length > 0 || Boolean(draft?.title));
+          setLoading(false);
+        },
+        (e: unknown) => {
+          if (alive) redirectIfUnauthorized(e, navigate);
+        },
+      );
+      return () => {
+        alive = false;
+      };
     }
-    setLoading(true);
-    apiJson
-      .get(apiPath`/quizzes/${id}`, QuizDetailSchema)
-      .then(({ quiz }) => {
+    Promise.all([apiJson.get(apiPath`/quizzes/${id}`, QuizDetailSchema), fetchDraftOwner()])
+      .then(([{ quiz }, me]) => {
         if (!alive) return;
+        setDraftOwner(me);
         const qs = applyServer(quiz);
         let shown = qs;
         // 24 h local draft (§ 5.3): restored only if it still differs from what the server holds.
-        const draft = readDraft(key);
+        const draft = me ? readDraft(key, me) : null;
         if (
           draft &&
           serialize(draft) !==
@@ -165,7 +191,7 @@ export function QuizEditorPage() {
           setQuestions(draft.questions);
           shown = draft.questions;
           setDraftRestored(true);
-        } else {
+        } else if (me) {
           clearDraft(key);
         }
         setSelectedKey(shown[0]?.key ?? null);
@@ -214,14 +240,28 @@ export function QuizEditorPage() {
   // --- Draft persistence -------------------------------------------------------------------------
 
   const currentDraftKey = draftKey(quizId);
+  /** Earliest time to ask `/auth/me` again after it failed at load: the draft safety net comes back. */
+  const ownerRetryAt = useRef(0);
   useEffect(() => {
     if (loading) return;
+    if (!draftOwner) {
+      if (dirty && Date.now() >= ownerRetryAt.current) {
+        ownerRetryAt.current = Date.now() + 30_000;
+        fetchDraftOwner().then(
+          (me) => {
+            if (me) setDraftOwner(me);
+          },
+          () => undefined, // a 401 surfaces on the next save
+        );
+      }
+      return;
+    }
     if (!dirty) {
       clearDraft(currentDraftKey);
       return;
     }
-    writeDraft(currentDraftKey, { title, description, questions });
-  }, [loading, dirty, currentDraftKey, title, description, questions]);
+    writeDraft(currentDraftKey, draftOwner, { title, description, questions });
+  }, [loading, draftOwner, dirty, currentDraftKey, title, description, questions]);
 
   // --- Mutations ---------------------------------------------------------------------------------
 
