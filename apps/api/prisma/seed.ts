@@ -29,7 +29,7 @@ async function main(): Promise<void> {
   }
   const passwordHash = await hashPassword(password);
   await prisma.admin.create({
-    data: { email, passwordHash, displayName: 'Administrateur' },
+    data: { email, passwordHash, displayName: 'Administrateur', role: 'ADMIN' },
   });
   console.log(`Seeded first admin: ${email}`);
 }

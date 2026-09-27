@@ -12,6 +12,8 @@ model Admin {
   email             String         @unique
   passwordHash      String
   displayName       String
+  // 'ADMIN' | 'USER', validated by AccountRole in @quiz/shared (SQLite has no enum).
+  role              String         @default("USER")
   isActive          Boolean        @default(true)
   // Credential version: bumped on every password change AND every deactivation, carried by each
   // access JWT (claim `pca`) and refresh token (`credentialVersion`). A token whose copy differs was

@@ -7,7 +7,7 @@ import { useNavigate } from 'react-router';
 
 import { z } from 'zod';
 
-import { ADMIN_PASSWORD_MIN_LENGTH as PASSWORD_MIN, type AdminDTO } from '@quiz/shared';
+import { AccountRole, ADMIN_PASSWORD_MIN_LENGTH as PASSWORD_MIN, type AdminDTO } from '@quiz/shared';
 
 import { apiJson, apiPath, ApiErrorThrown } from '../../lib/api-client.ts';
 import { NBSP } from '../../lib/format.ts';
@@ -22,6 +22,7 @@ const AdminsSchema = z.object({
       id: z.string(),
       email: z.string(),
       displayName: z.string(),
+      role: AccountRole,
       isActive: z.boolean(),
       createdAt: z.number(),
     }),

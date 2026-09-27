@@ -11,6 +11,7 @@ import {
   QUIZ_TITLE_MAX_LENGTH,
 } from '../constants.js';
 import {
+  AccountRole,
   LiveSessionSettings,
   LiveSessionSettingsPatch,
   MediaKind,
@@ -28,6 +29,7 @@ export const AdminDTO = z.object({
   id: z.string().uuid(),
   email: z.string().email(),
   displayName: z.string(),
+  role: AccountRole,
   isActive: z.boolean(),
   createdAt: z.number().int(),
 });
@@ -43,19 +45,31 @@ export const AdminCreateInput = z.object({
   email: z.string().email(),
   displayName: z.string().trim().min(1).max(ADMIN_DISPLAY_NAME_MAX_LENGTH),
   password: z.string().min(ADMIN_PASSWORD_MIN_LENGTH).max(ADMIN_PASSWORD_MAX_LENGTH),
+  // Least privilege: an account is a USER unless the body asks for ADMIN.
+  role: AccountRole.default('USER'),
 });
 export type AdminCreateInput = z.infer<typeof AdminCreateInput>;
 
-// No `password` here: an admin changes their own password through /auth/change-password (current
-// password required), and nobody resets a colleague's. Strict, so a body that still sends one is a
-// 400 rather than a silently ignored field.
+// No `password` here: an account changes its own password through /auth/change-password (current
+// password required), and an ADMIN resets another account's through POST /admins/:id/password
+// (AdminPasswordResetInput). Strict, so a body that still sends one is a 400 rather than a silently
+// ignored field.
 export const AdminPatchInput = z
   .object({
     displayName: z.string().trim().min(1).max(ADMIN_DISPLAY_NAME_MAX_LENGTH).optional(),
+    role: AccountRole.optional(),
     isActive: z.boolean().optional(),
   })
   .strict();
 export type AdminPatchInput = z.infer<typeof AdminPatchInput>;
+
+// POST /admins/:id/password: an ADMIN sets another account's password (no current password asked).
+export const AdminPasswordResetInput = z
+  .object({
+    password: AdminCreateInput.shape.password,
+  })
+  .strict();
+export type AdminPasswordResetInput = z.infer<typeof AdminPasswordResetInput>;
 
 export const ChangePasswordInput = z.object({
   currentPassword: z.string().min(1).max(ADMIN_PASSWORD_MAX_LENGTH),

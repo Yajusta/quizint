@@ -1,5 +1,6 @@
 // @quiz/shared — the front/back contract. Zero Node or DOM dependencies in src/.
 
+export * from './accounts.js';
 export * from './constants.js';
 export * from './errors.js';
 export * from './nickname.js';

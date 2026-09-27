@@ -51,11 +51,16 @@ let quizId = '';
 
 beforeAll(async () => {
   app = await buildApp();
-  // Seed a test admin directly.
+  // Seed a test admin directly, as the seed script does: an ADMIN.
   await app.prisma.admin.upsert({
     where: { email: TEST_EMAIL },
-    update: {},
-    create: { email: TEST_EMAIL, displayName: 'Test', passwordHash: await hash(TEST_PASSWORD) },
+    update: { role: 'ADMIN' },
+    create: {
+      email: TEST_EMAIL,
+      displayName: 'Test',
+      role: 'ADMIN',
+      passwordHash: await hash(TEST_PASSWORD),
+    },
   });
 }, 30000);
 
@@ -164,6 +169,47 @@ describe('auth', () => {
     const res = await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: cookiesObject(cookies) });
     expect(res.statusCode).toBe(200);
     expect(res.json().admin.email).toBe(TEST_EMAIL);
+    expect(res.json().admin.role).toBe('ADMIN');
+  });
+
+  it('admin list and creation carry the account role (USER unless asked)', async () => {
+    const list = await app.inject({ method: 'GET', url: '/api/v1/admins', cookies: cookiesObject(cookies) });
+    expect(list.statusCode).toBe(200);
+    const admins = list.json().admins as Array<{ email: string; role: string }>;
+    expect(admins.find((a) => a.email === TEST_EMAIL)?.role).toBe('ADMIN');
+
+    const create = (email: string, role?: 'ADMIN' | 'USER') =>
+      app.inject({
+        method: 'POST',
+        url: '/api/v1/admins',
+        cookies: cookiesObject(cookies),
+        payload: { email, displayName: 'Rôle', password: 'role-account-12', ...(role ? { role } : {}) },
+      });
+    const user = await create('role-default@example.fr');
+    const admin = await create('role-admin@example.fr', 'ADMIN');
+    const invalid = await create('role-invalid@example.fr', 'ROOT' as 'ADMIN');
+    try {
+      expect(user.statusCode).toBe(201);
+      expect(user.json().admin.role).toBe('USER');
+      expect(admin.statusCode).toBe(201);
+      expect(admin.json().admin.role).toBe('ADMIN');
+      expect(invalid.statusCode).toBe(400);
+      const stored = await app.prisma.admin.findMany({
+        where: { email: { in: ['role-default@example.fr', 'role-admin@example.fr'] } },
+        orderBy: { email: 'asc' },
+        select: { email: true, role: true },
+      });
+      expect(stored).toEqual([
+        { email: 'role-admin@example.fr', role: 'ADMIN' },
+        { email: 'role-default@example.fr', role: 'USER' },
+      ]);
+    } finally {
+      await app.prisma.admin.deleteMany({
+        where: {
+          email: { in: ['role-default@example.fr', 'role-admin@example.fr', 'role-invalid@example.fr'] },
+        },
+      });
+    }
   });
 
   it('wrong password → 401 with uniform message', async () => {

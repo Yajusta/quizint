@@ -20,6 +20,15 @@ import {
 } from '../constants.js';
 
 // ---------------------------------------------------------------------------
+// Accounts
+// ---------------------------------------------------------------------------
+
+// ADMIN does everything, account management included; USER manages only its own quizzes, sessions
+// and password. Stored as a String column (SQLite has no enum): this schema is the validation.
+export const AccountRole = z.enum(['ADMIN', 'USER']);
+export type AccountRole = z.infer<typeof AccountRole>;
+
+// ---------------------------------------------------------------------------
 // Question / quiz domain
 // ---------------------------------------------------------------------------
 

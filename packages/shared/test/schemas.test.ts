@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { ADMIN_PASSWORD_MAX_LENGTH, QUESTIONS_PER_QUIZ_MAX } from '../src/constants.js';
+import {
+  ADMIN_PASSWORD_MAX_LENGTH,
+  ADMIN_PASSWORD_MIN_LENGTH,
+  QUESTIONS_PER_QUIZ_MAX,
+} from '../src/constants.js';
 import { LiveSessionSettings, LiveSessionSettingsPatch, QuizExportV1 } from '../src/schemas/domain.js';
 import { ParticipantResumeAuth, PresenterAttachAuth, SettingsUpdateCommand } from '../src/schemas/events.js';
 import {
   AdminCreateInput,
+  AdminPasswordResetInput,
   AdminPatchInput,
   ChangePasswordInput,
   LoginInput,
@@ -33,6 +38,30 @@ describe('admin credentials', () => {
     expect(ChangePasswordInput.safeParse({ currentPassword: over, newPassword: max }).success).toBe(false);
     expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: over }).success).toBe(false);
     expect(ChangePasswordInput.safeParse({ currentPassword: 'x', newPassword: max }).success).toBe(true);
+    expect(AdminPasswordResetInput.safeParse({ password: max }).success).toBe(true);
+    expect(AdminPasswordResetInput.safeParse({ password: over }).success).toBe(false);
+  });
+
+  it('AdminPasswordResetInput is strict and applies the minimum length', () => {
+    expect(
+      AdminPasswordResetInput.safeParse({ password: 'x'.repeat(ADMIN_PASSWORD_MIN_LENGTH - 1) }).success,
+    ).toBe(false);
+    expect(AdminPasswordResetInput.safeParse({ password: 'a-new-password-12', extra: 1 }).success).toBe(
+      false,
+    );
+  });
+
+  it('AdminCreateInput defaults the role to USER and accepts ADMIN', () => {
+    const body = { email: 'a@example.fr', displayName: 'A', password: 'a-new-password-12' };
+    expect(AdminCreateInput.parse(body).role).toBe('USER');
+    expect(AdminCreateInput.parse({ ...body, role: 'ADMIN' }).role).toBe('ADMIN');
+    expect(AdminCreateInput.safeParse({ ...body, role: 'ROOT' }).success).toBe(false);
+  });
+
+  it('AdminPatchInput accepts a role and nothing else outside its fields', () => {
+    expect(AdminPatchInput.parse({ role: 'USER' })).toEqual({ role: 'USER' });
+    expect(AdminPatchInput.safeParse({ role: 'ROOT' }).success).toBe(false);
+    expect(AdminPatchInput.safeParse({ role: 'USER', email: 'b@example.fr' }).success).toBe(false);
   });
 });
 

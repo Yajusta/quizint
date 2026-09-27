@@ -9,6 +9,8 @@ import {
   ChangePasswordInput,
   LOGIN_ATTEMPTS_PER_MINUTE,
   LoginInput,
+  toAccountRole,
+  type AdminDTO,
 } from '@quiz/shared';
 
 import {
@@ -27,13 +29,15 @@ function toAdminDTO(a: {
   id: string;
   email: string;
   displayName: string;
+  role: string;
   isActive: boolean;
   createdAt: Date;
-}) {
+}): AdminDTO {
   return {
     id: a.id,
     email: a.email,
     displayName: a.displayName,
+    role: toAccountRole(a.role),
     isActive: a.isActive,
     createdAt: a.createdAt.getTime(),
   };
@@ -171,6 +175,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       data: {
         email: parsed.data.email.toLowerCase(),
         displayName: parsed.data.displayName,
+        role: parsed.data.role,
         passwordHash: await hashPassword(parsed.data.password),
       },
     });
