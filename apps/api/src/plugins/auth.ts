@@ -8,6 +8,8 @@ import fp from 'fastify-plugin';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomBytes } from 'node:crypto';
 
+import { toAccountRole, type AccountRole } from '@quiz/shared';
+
 import { getConfig, isDevOrTestEnv } from '../config.js';
 import {
   ACCESS_TOKEN_COOKIE,
@@ -56,10 +58,12 @@ export interface AccessTokenSubject {
 /**
  * Outcome of `verifyAccessToken`. `invalid`: bad signature, expired, wrong alg/iss/aud — a refresh
  * may fix it. `revoked`: a genuine token the server no longer honours (logged out, account inactive
- * or deleted, password changed since it was signed).
+ * or deleted, password changed since it was signed). `role` is read from the admin row on this very
+ * check, never from the token: a promotion or a demotion applies on the account's next request.
  */
 export type AccessTokenCheck =
-  { ok: true; adminId: string; email: string } | { ok: false; reason: 'invalid' | 'revoked' };
+  | { ok: true; adminId: string; email: string; role: AccountRole }
+  | { ok: false; reason: 'invalid' | 'revoked' };
 
 /**
  * Whether a credential version carried by a token (an access JWT's `pca`, a refresh row's
@@ -143,6 +147,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
 
   // Decorate request with the admin identity.
   app.decorateRequest('adminId', null);
+  app.decorateRequest('adminRole', null);
 
   app.decorate('verifyAccessToken', async (token: string): Promise<AccessTokenCheck> => {
     let claims: AccessClaims;
@@ -159,7 +164,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
     // one indexed lookup per request on a local SQLite file.
     const admin = await app.prisma.admin.findUnique({
       where: { id: claims.sub },
-      select: { isActive: true, passwordChangedAt: true },
+      select: { isActive: true, passwordChangedAt: true, role: true },
     });
     if (!admin?.isActive) return { ok: false, reason: 'revoked' };
     // Signed before the last password change: the claim is an exact copy of the column, so this
@@ -168,7 +173,7 @@ async function plugin(app: FastifyInstance): Promise<void> {
     if (!sameCredentialVersion(claims.pca, admin.passwordChangedAt)) {
       return { ok: false, reason: 'revoked' };
     }
-    return { ok: true, adminId: claims.sub, email: claims.email };
+    return { ok: true, adminId: claims.sub, email: claims.email, role: toAccountRole(admin.role) };
   });
 
   // authenticate guard — use as preHandler on protected routes.
@@ -178,6 +183,12 @@ async function plugin(app: FastifyInstance): Promise<void> {
     const check = await app.verifyAccessToken(token);
     if (!check.ok) return reply.status(401).send(apiError('UNAUTHORIZED'));
     req.adminId = check.adminId;
+    req.adminRole = check.role;
+  });
+
+  // Account-management guard — a preHandler listed after `authenticate`, whose fresh role it reads.
+  app.decorate('requireAdmin', async (req: FastifyRequest, reply: FastifyReply) => {
+    if (req.adminRole !== 'ADMIN') return reply.status(403).send(apiError('FORBIDDEN'));
   });
 
   // Issue the access JWT cookie, bound to the admin's current credential version.

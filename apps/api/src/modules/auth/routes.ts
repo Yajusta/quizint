@@ -1,5 +1,6 @@
 // Auth routes (§5.1): login, refresh, logout, me, admin management, change-password.
 
+import type { Prisma } from '@prisma/client';
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 
 import {
@@ -10,6 +11,7 @@ import {
   LOGIN_ATTEMPTS_PER_MINUTE,
   LoginInput,
   toAccountRole,
+  wouldRemoveLastAdmin,
   type AdminDTO,
 } from '@quiz/shared';
 
@@ -41,6 +43,15 @@ function toAdminDTO(a: {
     isActive: a.isActive,
     createdAt: a.createdAt.getTime(),
   };
+}
+
+// Whether `adminId` is an active ADMIN right now, read on `tx`: account-management writes call it
+// inside their transaction, after requireAdmin, so a demotion or a deactivation committed while the
+// request was in flight is honoured before anything is written.
+async function isActiveAdmin(tx: Prisma.TransactionClient, adminId: string | null): Promise<boolean> {
+  if (adminId === null) return false;
+  const actor = await tx.admin.findUnique({ where: { id: adminId }, select: { role: true, isActive: true } });
+  return actor !== null && actor.isActive && toAccountRole(actor.role) === 'ADMIN';
 }
 
 export async function authRoutes(app: FastifyInstance): Promise<void> {
@@ -157,78 +168,106 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return { admin: toAdminDTO(admin) };
   });
 
+  // Account management is ADMIN-only. requireAdmin reads the role authenticate loaded on this very
+  // request, so a demoted account loses these routes from its next request, with the same access
+  // token; the writes (POST, PATCH) check it once more inside their transaction (isActiveAdmin), so a
+  // request already in flight when the demotion commits writes nothing either.
+  const adminOnly = [app.authenticate, app.requireAdmin];
+
   // --- GET /api/v1/admins ---------------------------------------------------
-  app.get('/admins', { preHandler: app.authenticate }, async () => {
+  app.get('/admins', { preHandler: adminOnly }, async () => {
     const admins = await app.prisma.admin.findMany({ orderBy: { createdAt: 'asc' } });
     return { admins: admins.map(toAdminDTO) };
   });
 
   // --- POST /api/v1/admins --------------------------------------------------
-  app.post('/admins', { preHandler: app.authenticate }, async (req, reply) => {
+  app.post('/admins', { preHandler: adminOnly }, async (req, reply) => {
     const parsed = AdminCreateInput.safeParse(req.body);
     if (!parsed.success) {
       return reply.status(400).send(validationError(parsed.error));
     }
     const existing = await app.prisma.admin.findUnique({ where: { email: parsed.data.email.toLowerCase() } });
     if (existing) return reply.status(409).send(apiError('VALIDATION'));
-    const admin = await app.prisma.admin.create({
-      data: {
-        email: parsed.data.email.toLowerCase(),
-        displayName: parsed.data.displayName,
-        role: parsed.data.role,
-        passwordHash: await hashPassword(parsed.data.password),
-      },
-    });
+    const passwordHash = await hashPassword(parsed.data.password);
+    // The caller's role is checked again next to the write: the argon2 run above leaves room for a
+    // demotion committed since requireAdmin, and a demoted account must not mint an ADMIN.
+    const admin = await app.prisma.$transaction(async (tx) => {
+      if (!(await isActiveAdmin(tx, req.adminId))) return 'FORBIDDEN' as const;
+      return tx.admin.create({
+        data: {
+          email: parsed.data.email.toLowerCase(),
+          displayName: parsed.data.displayName,
+          role: parsed.data.role,
+          passwordHash,
+        },
+      });
+    }, REQUEST_TX_OPTIONS);
+    if (admin === 'FORBIDDEN') return reply.status(403).send(apiError('FORBIDDEN'));
     return reply.status(201).send({ admin: toAdminDTO(admin) });
   });
 
   // --- PATCH /api/v1/admins/:id --------------------------------------------
-  app.patch<{ Params: { id: string } }>(
-    '/admins/:id',
-    { preHandler: app.authenticate },
-    async (req, reply) => {
-      const parsed = AdminPatchInput.safeParse(req.body);
-      if (!parsed.success) {
-        return reply.status(400).send(validationError(parsed.error));
+  app.patch<{ Params: { id: string } }>('/admins/:id', { preHandler: adminOnly }, async (req, reply) => {
+    const parsed = AdminPatchInput.safeParse(req.body);
+    if (!parsed.success) {
+      return reply.status(400).send(validationError(parsed.error));
+    }
+    const { displayName, role, isActive } = parsed.data;
+    const deactivating = isActive === false;
+    // Self-deactivation is refused, so the credential bump below never hits the caller's own session.
+    // Self-demotion is allowed, as long as another active ADMIN remains (checked below).
+    if (deactivating && req.params.id === req.adminId) {
+      return reply.status(409).send(apiError('CANNOT_DEACTIVATE_SELF'));
+    }
+    const data = {
+      ...(displayName !== undefined ? { displayName } : {}),
+      ...(role !== undefined ? { role } : {}),
+      ...(isActive !== undefined ? { isActive } : {}),
+    };
+    // One transaction: re-check the caller is still an active ADMIN, read the target, count the
+    // active ADMINs, refuse LAST_ADMIN if none would remain, then write. Interactive transactions run
+    // one at a time on the single SQLite connection, so two ADMINs demoting each other at once cannot
+    // both read a count of two (the second sees the first one's write and is refused), and a caller
+    // demoted while its request was in flight cannot undo that demotion (FORBIDDEN).
+    // A deactivation also bumps the credential version in that transaction: every access JWT and
+    // refresh token issued before it is refused for good, not only while `isActive` is false — a
+    // copied cookie does not come back to life on reactivation, and a login racing this update mints
+    // tokens under the old version. The version is read in the transaction and moved strictly past
+    // it, so a password change committed in the same millisecond cannot end up sharing it.
+    // Reactivation does not bump: nothing is live to revoke. A role change alone revokes nothing
+    // either: authenticate reads the role on every request, so it applies from the next one.
+    const admin = await app.prisma.$transaction(async (tx) => {
+      if (!(await isActiveAdmin(tx, req.adminId))) return 'FORBIDDEN' as const;
+      const current = await tx.admin.findUnique({
+        where: { id: req.params.id },
+        select: { role: true, isActive: true, passwordChangedAt: true },
+      });
+      if (!current) return 'NOT_FOUND' as const;
+      if (deactivating || role !== undefined) {
+        const activeAdminCount = await tx.admin.count({ where: { isActive: true, role: 'ADMIN' } });
+        const before = { role: toAccountRole(current.role), isActive: current.isActive };
+        if (wouldRemoveLastAdmin(before, { role, isActive }, activeAdminCount)) {
+          return 'LAST_ADMIN' as const;
+        }
       }
-      const target = await app.prisma.admin.findUnique({ where: { id: req.params.id } });
-      if (!target) return reply.status(404).send(apiError('NOT_FOUND'));
-      const deactivating = parsed.data.isActive === false;
-      // Self-deactivation is refused, so the credential bump below never hits the caller's own session.
-      if (deactivating && target.id === req.adminId) {
-        return reply.status(409).send(apiError('CANNOT_DEACTIVATE_SELF'));
-      }
-      // A deactivation bumps the credential version in the same transaction: every access JWT and
-      // refresh token issued before it is refused for good, not only while `isActive` is false — a
-      // copied cookie does not come back to life on reactivation, and a login racing this update mints
-      // tokens under the old version. The version is read in the transaction and moved strictly past
-      // it, so a password change committed in the same millisecond cannot end up sharing it.
-      // Reactivation does not bump: nothing is live to revoke.
-      // Anything else is a single update, off the transaction.
-      const data = {
-        ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
-        ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
-      };
-      const admin = deactivating
-        ? await app.prisma.$transaction(async (tx) => {
-            const current = await tx.admin.findUniqueOrThrow({
-              where: { id: req.params.id },
-              select: { passwordChangedAt: true },
-            });
-            return tx.admin.update({
-              where: { id: req.params.id },
-              data: { ...data, passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) },
-            });
-          }, REQUEST_TX_OPTIONS)
-        : await app.prisma.admin.update({ where: { id: req.params.id }, data });
-      // A deactivation ends the account's sessions, whoever holds them. There is no password field
-      // here (AdminPatchInput is strict): nobody resets a colleague's password.
-      if (deactivating) {
-        await app.revokeAdminSessions(admin.id);
-      }
-      return { admin: toAdminDTO(admin) };
-    },
-  );
+      return tx.admin.update({
+        where: { id: req.params.id },
+        data: deactivating
+          ? { ...data, passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) }
+          : data,
+      });
+    }, REQUEST_TX_OPTIONS);
+    // Refused inside the transaction: nothing was written.
+    if (admin === 'FORBIDDEN') return reply.status(403).send(apiError('FORBIDDEN'));
+    if (admin === 'NOT_FOUND') return reply.status(404).send(apiError('NOT_FOUND'));
+    if (admin === 'LAST_ADMIN') return reply.status(409).send(apiError('LAST_ADMIN'));
+    // A deactivation ends the account's sessions, whoever holds them. There is no password field
+    // here (AdminPatchInput is strict): nobody resets a colleague's password.
+    if (deactivating) {
+      await app.revokeAdminSessions(admin.id);
+    }
+    return { admin: toAdminDTO(admin) };
+  });
 
   // --- POST /api/v1/auth/change-password ------------------------------------
   // The limit runs as a preHandler, after authenticate (appended to the route's preHandler array),

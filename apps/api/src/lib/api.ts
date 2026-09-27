@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import type { FastifyReply } from 'fastify';
 import { z } from 'zod';
 
-import { errorMessage } from '@quiz/shared';
+import { errorMessage, type AccountRole } from '@quiz/shared';
 
 export const ACCESS_TOKEN_COOKIE = 'access_token';
 export const REFRESH_TOKEN_COOKIE = 'refresh_token';
@@ -34,9 +34,13 @@ export interface AdminJwtPayload {
 declare module 'fastify' {
   interface FastifyInstance {
     authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    /** preHandler after `authenticate`: 403 FORBIDDEN unless the account is an ADMIN. */
+    requireAdmin: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
   interface FastifyRequest {
     adminId: string | null;
+    /** The account's role as read from the database by `authenticate`, on this very request. */
+    adminRole: AccountRole | null;
   }
 }
 

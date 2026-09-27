@@ -917,6 +917,239 @@ describe('account security', () => {
   });
 });
 
+describe('account roles', () => {
+  // Logins from their own addresses (shared-address range): the login route allows 10 per minute
+  // and per IP, and the suites above already spend most of 127.0.0.1's budget.
+  let nextIp = 1;
+  const login = (email: string, password: string) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: `100.64.0.${nextIp++}`,
+      payload: { email, password },
+    });
+  // The suite's ADMIN session, read at call time.
+  const suite = () => cookiesObject(cookies);
+  const listAdmins = (c: Record<string, string>) =>
+    app.inject({ method: 'GET', url: '/api/v1/admins', cookies: c });
+  const patchAdmin = (c: Record<string, string>, id: string, payload: Record<string, unknown>) =>
+    app.inject({ method: 'PATCH', url: `/api/v1/admins/${id}`, cookies: c, payload });
+  const activeAdminCount = () => app.prisma.admin.count({ where: { isActive: true, role: 'ADMIN' } });
+  const selfId = async () => (await app.prisma.admin.findUniqueOrThrow({ where: { email: TEST_EMAIL } })).id;
+
+  /**
+   * An account created by the suite's ADMIN, signed in on its own session. Deleted when the test
+   * ends (its quizzes and sessions first), and the suite's account is ADMIN again whatever happened.
+   */
+  async function account(email: string, role: 'ADMIN' | 'USER') {
+    const password = 'role-account-pass-12';
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/admins',
+      cookies: suite(),
+      payload: { email, displayName: 'Compte', password, role },
+    });
+    expect(created.statusCode).toBe(201);
+    const id = created.json().admin.id as string;
+    onTestFinished(async () => {
+      // The suite's account first: a failing delete below must not leave it a USER for later suites.
+      await app.prisma.admin.update({ where: { email: TEST_EMAIL }, data: { role: 'ADMIN' } });
+      await app.prisma.liveSession.deleteMany({ where: { presenterId: id } });
+      await app.prisma.quiz.deleteMany({ where: { ownerId: id } });
+      await app.prisma.admin.delete({ where: { id } });
+    });
+    const signedIn = await login(email, password);
+    expect(signedIn.statusCode).toBe(200);
+    return { id, password, cookies: cookiesObject(setCookieOf(signedIn)) };
+  }
+
+  it('the suite starts with a single active ADMIN (the test account)', async () => {
+    expect(await activeAdminCount()).toBe(1);
+  });
+
+  it('a USER is refused account management with 403 FORBIDDEN', async () => {
+    const user = await account('role-user-forbidden@example.fr', 'USER');
+    const refusals = [
+      await listAdmins(user.cookies),
+      await app.inject({
+        method: 'POST',
+        url: '/api/v1/admins',
+        cookies: user.cookies,
+        payload: { email: 'role-sneaky@example.fr', displayName: 'Sneaky', password: 'sneaky-pass-1234' },
+      }),
+      await patchAdmin(user.cookies, user.id, { role: 'ADMIN' }),
+      await patchAdmin(user.cookies, await selfId(), { isActive: false }),
+    ];
+    for (const res of refusals) {
+      expect(res.statusCode).toBe(403);
+      expect(res.json().error.code).toBe('FORBIDDEN');
+    }
+    // Nothing was written.
+    expect(await app.prisma.admin.findUnique({ where: { email: 'role-sneaky@example.fr' } })).toBeNull();
+    expect((await app.prisma.admin.findUniqueOrThrow({ where: { id: user.id } })).role).toBe('USER');
+    expect(await activeAdminCount()).toBe(1);
+  });
+
+  it('a USER still manages its own quizzes, sessions and password', async () => {
+    const user = await account('role-user-own@example.fr', 'USER');
+    const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: user.cookies });
+    expect(me.statusCode).toBe(200);
+    expect(me.json().admin.role).toBe('USER');
+
+    const quiz = await app.inject({
+      method: 'POST',
+      url: '/api/v1/quizzes',
+      cookies: user.cookies,
+      payload: { title: 'Quiz d’un utilisateur', description: null },
+    });
+    expect(quiz.statusCode).toBe(201);
+    const quizId = quiz.json().quiz.id as string;
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quizId}/questions`,
+      cookies: user.cookies,
+      payload: {
+        questions: [
+          {
+            type: 'MCQ',
+            prompt: 'Capitale de la France ?',
+            pointsCorrect: 100,
+            pointsWrong: 0,
+            timeLimitSec: null,
+            choices: [
+              { label: 'Paris', isCorrect: true },
+              { label: 'Lyon', isCorrect: false },
+            ],
+          },
+        ],
+      },
+    });
+    expect(put.statusCode).toBe(200);
+    const session = await app.inject({
+      method: 'POST',
+      url: `/api/v1/quizzes/${quizId}/sessions`,
+      cookies: user.cookies,
+      payload: {},
+    });
+    expect(session.statusCode).toBe(201);
+    const sessionId = session.json().sessionId as string;
+    const sessions = await app.inject({ method: 'GET', url: '/api/v1/sessions', cookies: user.cookies });
+    expect(sessions.statusCode).toBe(200);
+    expect((sessions.json().sessions as Array<{ id: string }>).map((s) => s.id)).toEqual([sessionId]);
+    // The session may have been loaded in memory: end it through the API, not only in the database.
+    expect(
+      (await app.inject({ method: 'DELETE', url: `/api/v1/sessions/${sessionId}`, cookies: user.cookies }))
+        .statusCode,
+    ).toBeLessThan(300);
+
+    const changed = await app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/change-password',
+      cookies: user.cookies,
+      payload: { currentPassword: user.password, newPassword: 'role-account-new-12' },
+    });
+    expect(changed.statusCode).toBe(204);
+  });
+
+  it('a promotion or a demotion applies on the next request, with the same access token', async () => {
+    const user = await account('role-user-promoted@example.fr', 'USER');
+    expect((await listAdmins(user.cookies)).statusCode).toBe(403);
+
+    const promoted = await patchAdmin(suite(), user.id, { role: 'ADMIN' });
+    expect(promoted.statusCode).toBe(200);
+    expect(promoted.json().admin.role).toBe('ADMIN');
+    // No re-login: the role is read from the database on every request, never from the JWT.
+    expect((await listAdmins(user.cookies)).statusCode).toBe(200);
+
+    const demoted = await patchAdmin(suite(), user.id, { role: 'USER' });
+    expect(demoted.statusCode).toBe(200);
+    expect(demoted.json().admin.role).toBe('USER');
+    const refused = await listAdmins(user.cookies);
+    expect(refused.statusCode).toBe(403);
+    // A role change revokes nothing: the demoted account is still signed in.
+    expect(
+      (await app.inject({ method: 'GET', url: '/api/v1/auth/me', cookies: user.cookies })).statusCode,
+    ).toBe(200);
+  });
+
+  it('the last active ADMIN cannot demote itself', async () => {
+    expect(await activeAdminCount()).toBe(1);
+    const res = await patchAdmin(suite(), await selfId(), { role: 'USER' });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.code).toBe('LAST_ADMIN');
+    // Neither with a reactivation in the same patch: the account still ends up a USER.
+    const combined = await patchAdmin(suite(), await selfId(), { role: 'USER', isActive: true });
+    expect(combined.statusCode).toBe(409);
+    expect(combined.json().error.code).toBe('LAST_ADMIN');
+    expect((await app.prisma.admin.findUniqueOrThrow({ where: { email: TEST_EMAIL } })).role).toBe('ADMIN');
+    // Deactivating oneself stays refused on its own ground.
+    const deactivate = await patchAdmin(suite(), await selfId(), { isActive: false });
+    expect(deactivate.statusCode).toBe(409);
+    expect(deactivate.json().error.code).toBe('CANNOT_DEACTIVATE_SELF');
+  });
+
+  it('an ADMIN demotes another ADMIN, then can demote itself only while another remains', async () => {
+    const other = await account('role-admin-other@example.fr', 'ADMIN');
+    expect(await activeAdminCount()).toBe(2);
+    expect((await listAdmins(other.cookies)).statusCode).toBe(200);
+
+    const demoted = await patchAdmin(suite(), other.id, { role: 'USER' });
+    expect(demoted.statusCode).toBe(200);
+    expect((await listAdmins(other.cookies)).statusCode).toBe(403);
+    expect(await activeAdminCount()).toBe(1);
+    const self = await patchAdmin(suite(), await selfId(), { role: 'USER' });
+    expect(self.statusCode).toBe(409);
+    expect(self.json().error.code).toBe('LAST_ADMIN');
+
+    // Promoted back: now the suite's account may step down, and the other one takes over.
+    expect((await patchAdmin(suite(), other.id, { role: 'ADMIN' })).statusCode).toBe(200);
+    const stepDown = await patchAdmin(suite(), await selfId(), { role: 'USER' });
+    expect(stepDown.statusCode).toBe(200);
+    expect((await listAdmins(suite())).statusCode).toBe(403);
+    expect((await listAdmins(other.cookies)).statusCode).toBe(200);
+    expect(await activeAdminCount()).toBe(1);
+  });
+
+  it('an inactive ADMIN does not count: the only active one still cannot step down', async () => {
+    const other = await account('role-admin-inactive@example.fr', 'ADMIN');
+    // Role kept, account deactivated in the same patch: allowed while the suite's account remains.
+    const deactivated = await patchAdmin(suite(), other.id, { role: 'ADMIN', isActive: false });
+    expect(deactivated.statusCode).toBe(200);
+    expect(deactivated.json().admin).toMatchObject({ role: 'ADMIN', isActive: false });
+    expect(await activeAdminCount()).toBe(1);
+    // The deactivation still ends that account's sessions at once.
+    expect((await listAdmins(other.cookies)).statusCode).toBe(401);
+
+    const self = await patchAdmin(suite(), await selfId(), { role: 'USER' });
+    expect(self.statusCode).toBe(409);
+    expect(self.json().error.code).toBe('LAST_ADMIN');
+
+    // Reactivated (and kept ADMIN) in one patch: two active ADMINs again.
+    const reactivated = await patchAdmin(suite(), other.id, { role: 'ADMIN', isActive: true });
+    expect(reactivated.statusCode).toBe(200);
+    expect(await activeAdminCount()).toBe(2);
+  });
+
+  it('two ADMINs demoting each other at once: exactly one wins, one ADMIN remains', async () => {
+    const other = await account('role-admin-race@example.fr', 'ADMIN');
+    const self = await selfId();
+    expect(await activeAdminCount()).toBe(2);
+    const results = await Promise.all([
+      patchAdmin(other.cookies, self, { role: 'USER' }),
+      patchAdmin(suite(), other.id, { role: 'USER' }),
+    ]);
+    // The loser is refused LAST_ADMIN, or FORBIDDEN when the winner demoted it before its own request
+    // passed authenticate.
+    expect(results.filter((r) => r.statusCode === 200)).toHaveLength(1);
+    const loser = results.find((r) => r.statusCode !== 200)!;
+    expect([
+      { status: 409, code: 'LAST_ADMIN' },
+      { status: 403, code: 'FORBIDDEN' },
+    ]).toContainEqual({ status: loser.statusCode, code: loser.json().error.code });
+    expect(await activeAdminCount()).toBe(1);
+  });
+});
+
 describe('auth hardening', () => {
   // Logins from their own documentation-range addresses: the login route allows 10 per minute and
   // per IP, and the suite above already spends most of 127.0.0.1's budget.
