@@ -443,6 +443,63 @@ describe('sessions', () => {
     expect(okPage.json()).toMatchObject({ page: 2, answers: [] });
   });
 
+  it('join lookup returns the frozen title and never reads the snapshot of a closed session', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: `/api/v1/quizzes/${quizId}/sessions`,
+      cookies: cookiesObject(cookies),
+      payload: {},
+    });
+    const { sessionId: sid, code } = created.json() as { sessionId: string; code: string };
+    // The snapshot title, not the Quiz row's: rewrite it so the two differ.
+    const row = await app.prisma.liveSession.findUniqueOrThrow({
+      where: { id: sid },
+      select: { quizSnapshot: true },
+    });
+    await app.prisma.liveSession.update({
+      where: { id: sid },
+      data: { quizSnapshot: { ...(row.quizSnapshot as object), title: 'Titre figé « ; » "x"' } },
+    });
+    const open = await app.inject({ method: 'GET', url: `/api/v1/join/${code.toLowerCase()}` });
+    expect(open.statusCode).toBe(200);
+    expect(open.json()).toEqual({
+      sessionId: sid,
+      quizTitle: 'Titre figé « ; » "x"',
+      phase: 'LOBBY',
+      participantCount: 0,
+    });
+
+    // Session deleted between the row read and the title read: 404, not a title-less 200.
+    const vanished = vi
+      .spyOn(app.prisma, '$queryRaw')
+      .mockImplementationOnce(() => Promise.resolve([]) as never);
+    try {
+      const gone = await app.inject({ method: 'GET', url: `/api/v1/join/${code}` });
+      expect(gone.statusCode).toBe(404);
+      expect(gone.json().error.code).toBe('SESSION_NOT_FOUND');
+    } finally {
+      vanished.mockRestore();
+    }
+
+    await app.prisma.liveSession.update({ where: { id: sid }, data: { phase: 'ENDED' } });
+    const findUnique = vi.spyOn(app.prisma.liveSession, 'findUnique');
+    const queryRaw = vi.spyOn(app.prisma, '$queryRaw');
+    try {
+      const closed = await app.inject({ method: 'GET', url: `/api/v1/join/${code}` });
+      expect(closed.statusCode).toBe(410);
+      expect(closed.json().error.code).toBe('SESSION_CLOSED_TO_JOIN');
+      // Only the route's own calls: the delegate is shared with SessionManager and the media routes.
+      const titleReads = queryRaw.mock.calls.filter((c) => JSON.stringify(c).includes('json_extract'));
+      expect(titleReads).toHaveLength(0);
+      const lookups = findUnique.mock.calls.filter((c) => JSON.stringify(c).includes(code));
+      expect(lookups).toHaveLength(1);
+      expect(JSON.stringify(lookups[0])).not.toContain('quizSnapshot');
+    } finally {
+      findUnique.mockRestore();
+      queryRaw.mockRestore();
+    }
+  });
+
   it('scores CSV ranks like the live final view and leaves kicked participants unranked', async () => {
     const created = await app.inject({
       method: 'POST',

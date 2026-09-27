@@ -209,22 +209,29 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     '/join/:code',
     { config: { rateLimit: { max: MAX_PARTICIPANTS_PER_SESSION * 3, timeWindow: '1 minute' } } },
     async (req, reply) => {
+      // Never the snapshot column here: it can weigh megabytes, and this route is anonymous.
       const session = await app.prisma.liveSession.findUnique({
         where: { code: req.params.code.toUpperCase() },
         select: {
           id: true,
           phase: true,
-          quizSnapshot: true,
           _count: { select: { participants: { where: { isKicked: false } } } },
         },
       });
       if (!session) return reply.status(404).send(apiError('SESSION_NOT_FOUND'));
       const phase = asPhase(session.phase);
       if (!isJoinable(phase)) return reply.status(410).send(apiError('SESSION_CLOSED_TO_JOIN'));
-      const snapshot = session.quizSnapshot as { title?: string };
+      // The frozen title (not the live Quiz row, which may have been renamed since), extracted
+      // by SQLite: only that string crosses into the process, the JSON is never parsed in JS.
+      const rows = await app.prisma.$queryRaw<Array<{ title: unknown }>>`
+        SELECT json_extract("quizSnapshot", '$.title') AS "title" FROM "LiveSession"
+        WHERE "id" = ${session.id}`;
+      // Deleted between the two reads: same answer as an unknown code, never a title-less 200.
+      if (rows.length === 0) return reply.status(404).send(apiError('SESSION_NOT_FOUND'));
+      const title = rows[0]?.title;
       return {
         sessionId: session.id,
-        quizTitle: snapshot.title ?? '',
+        quizTitle: typeof title === 'string' ? title : '',
         phase,
         participantCount: session._count.participants,
       };
