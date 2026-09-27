@@ -87,6 +87,19 @@ export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
  * made-up emails costs bounded memory (a key is a fixed-size hash, ~100 bytes a slot).
  */
 export const LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX = 20_000;
+/**
+ * Global cap on Argon2id work (hash and verify, login included), per API process. Each run holds one
+ * libuv threadpool thread (4 by default, shared with fs, dns, zlib and sharp), plus the native
+ * threads of its own lanes (argon2's default parallelism, 4), and 64 MiB for ~0.1 s: at most
+ * ARGON2_MAX_CONCURRENCY run at once (bounding the pool slots and memory taken, not all CPU contention), at most ARGON2_MAX_QUEUE wait behind them, and a wait
+ * longer than ARGON2_QUEUE_TIMEOUT_MS gives up. Past either bound the request is refused RATE_LIMITED
+ * (Retry-After ARGON2_BUSY_RETRY_AFTER_S) without touching the account's login budget, so a burst of
+ * pre-auth logins from many addresses cannot starve the rest of the process.
+ */
+export const ARGON2_MAX_CONCURRENCY = 2;
+export const ARGON2_MAX_QUEUE = 32;
+export const ARGON2_QUEUE_TIMEOUT_MS = 5_000;
+export const ARGON2_BUSY_RETRY_AFTER_S = 2;
 
 /**
  * Per-address limits (REST rate limits, socket handshake and join buckets, socket caps) key an IPv6

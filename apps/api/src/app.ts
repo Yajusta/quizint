@@ -9,6 +9,7 @@ import helmet from '@fastify/helmet';
 
 import { devJwtSecretWarning, getConfig, isDevOrTestEnv } from './config.js';
 import { apiError } from './lib/api.js';
+import { PasswordHashingBusyError } from './lib/password.js';
 import { trustCaddyHop } from './lib/proxy.js';
 import { RateLimitedError, rateLimitErrorResponse, rateLimitKeyGenerator } from './lib/rate-limit.js';
 import { authPlugin } from './plugins/auth.js';
@@ -41,12 +42,19 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   // Set before any plugin is registered so every encapsulated context inherits it. A rate-limit
   // refusal (thrown by @fastify/rate-limit through rateLimitErrorResponse, its Retry-After header
-  // already set) gets the standard RATE_LIMITED envelope. Any other 4xx keeps Fastify's own answer
-  // (rethrown to the default handler: multipart 413, bad JSON 400…); a 5xx is logged and answered
-  // with the generic INTERNAL envelope, never the raw message (a Prisma error text names tables,
-  // columns and constraints).
+  // already set, or by the Argon2 limiter of lib/password.ts, carrying its own) gets the standard
+  // RATE_LIMITED envelope. Any other 4xx keeps Fastify's own answer (rethrown to the default
+  // handler: multipart 413, bad JSON 400…); a 5xx is logged and answered with the generic INTERNAL
+  // envelope, never the raw message (a Prisma error text names tables, columns and constraints).
   app.setErrorHandler((error: FastifyError, req, reply) => {
-    if (error instanceof RateLimitedError) return reply.status(429).send(apiError('RATE_LIMITED'));
+    if (error instanceof RateLimitedError) {
+      // The only trace of a saturated Argon2 limiter (a login flood): nothing else logs it.
+      if (error instanceof PasswordHashingBusyError) {
+        req.log.warn('argon2 limiter saturated, request refused');
+      }
+      if (error.retryAfter !== undefined) reply.header('retry-after', error.retryAfter);
+      return reply.status(429).send(apiError('RATE_LIMITED'));
+    }
     const status = error.statusCode ?? 500;
     if (status < 500) throw error;
     req.log.error({ err: error }, 'request failed');

@@ -61,16 +61,37 @@ describe('LoginFailureTracker', () => {
 
   it('uncountFailure gives back one attempt without moving the window', () => {
     const { t } = tracker();
-    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) t.countFailure('a@example.fr');
-    t.uncountFailure('a@example.fr');
+    let window = 0;
+    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) window = t.countFailure('a@example.fr');
+    t.uncountFailure('a@example.fr', window);
     expect(t.throttledFor('a@example.fr')).toBeNull();
     t.countFailure('a@example.fr');
     expect(t.throttledFor('a@example.fr')).not.toBeNull();
     const { t: fresh } = tracker();
-    fresh.countFailure('b@example.fr');
-    fresh.uncountFailure('b@example.fr');
-    fresh.uncountFailure('never@example.fr');
+    const b = fresh.countFailure('b@example.fr');
+    fresh.uncountFailure('b@example.fr', b);
+    fresh.uncountFailure('never@example.fr', b);
     expect(fresh.size).toBe(0);
+  });
+
+  it('uncountFailure never takes an attempt back from a later window than the one it was counted in', () => {
+    const { clock, t } = tracker();
+    // Counted in W1, refused (a queued Argon2 wait) only after W1 expired and W2 filled up.
+    const w1 = t.countFailure('a@example.fr');
+    clock.now += LOGIN_FAILURE_WINDOW_MS;
+    let w2 = 0;
+    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) w2 = t.countFailure('a@example.fr');
+    expect(w2).not.toBe(w1);
+    t.uncountFailure('a@example.fr', w1);
+    expect(t.throttledFor('a@example.fr')).not.toBeNull();
+    // Nor from the window a success reset and a later failure opened.
+    const { clock: c2, t: t2 } = tracker();
+    const before = t2.countFailure('b@example.fr');
+    t2.reset('b@example.fr');
+    c2.now += 1;
+    t2.countFailure('b@example.fr');
+    t2.uncountFailure('b@example.fr', before);
+    expect(t2.size).toBe(1);
   });
 
   it('refuses a cap below one instead of spinning in its eviction loop', () => {

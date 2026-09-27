@@ -10,6 +10,8 @@ import { createHmac } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
+  ARGON2_MAX_CONCURRENCY,
+  ARGON2_MAX_QUEUE,
   AUTO_CLOSE_RETRY_BASE_MS,
   CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
   ENDED_PURGE_DELAY_MS,
@@ -21,6 +23,7 @@ import {
 } from '@quiz/shared';
 
 import { buildApp } from '../src/app.js';
+import { argon2Limiter } from '../src/lib/password.js';
 import { trustCaddyHop } from '../src/lib/proxy.js';
 import { getConfig } from '../src/config.js';
 import { JWT_AUDIENCE, JWT_ISSUER, REFRESH_ROTATION_GRACE_MS } from '../src/plugins/auth.js';
@@ -59,6 +62,13 @@ function setCookieOf(res: { cookies: Array<{ name: string; value: string }> }): 
 }
 
 const b64url = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+
+/**
+ * Timeout of a test running many real Argon2id operations in a row (~0.1 s each, several times that
+ * on a loaded machine, and at most ARGON2_MAX_CONCURRENCY at once): vitest's 5 s default is too
+ * tight for them.
+ */
+const ARGON2_HEAVY_TEST_TIMEOUT_MS = 30_000;
 
 describe('health', () => {
   it('GET /healthz → ok', async () => {
@@ -1349,7 +1359,7 @@ describe('deactivation revokes issued credentials', () => {
   });
 });
 
-describe('change-password rate limit', () => {
+describe('change-password rate limit', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }, () => {
   // Dedicated admins and documentation-range addresses: the budget is per admin, and neither the
   // suite's admin nor 127.0.0.1's buckets must move.
   const password = 'guessed-pass-12';
@@ -2867,7 +2877,7 @@ describe('live engine', () => {
   });
 });
 
-describe('login throttling', () => {
+describe('login throttling', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }, () => {
   // Clients behind Caddy (a private peer) so X-Forwarded-For names them: IPv6 documentation-range
   // addresses, one /64 per `net` value. Dedicated emails, so no other test's budget moves.
   const caddy = '172.18.0.9';
@@ -2950,6 +2960,89 @@ describe('login throttling', () => {
       // 9 + 1 + 9 attempts in all: without the reset, the second round would end in 429s.
       expect((await login(from(freshNet()), email, password)).statusCode).toBe(200);
     }
+  });
+
+  describe('saturated Argon2 limiter', () => {
+    const busyEmail = 'throttle-busy@example.fr';
+    // Fills every running slot and every queue place of the process-wide limiter; the returned
+    // function frees them all. The limiter is shared by the whole file: it must be idle first (after
+    // the calls below it always looks full, whatever was in flight), and the caller frees it in a
+    // `finally`. A held wait that timed out meanwhile is settled, never an unhandled rejection.
+    const saturate = () => {
+      expect({ running: argon2Limiter.running, queued: argon2Limiter.queued }).toEqual({
+        running: 0,
+        queued: 0,
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const held = Array.from({ length: ARGON2_MAX_CONCURRENCY + ARGON2_MAX_QUEUE }, () =>
+        argon2Limiter.run(() => gate).catch(() => undefined),
+      );
+      return async () => {
+        release();
+        await Promise.all(held);
+      };
+    };
+
+    beforeAll(async () => {
+      await app.prisma.admin.create({
+        data: { email: busyEmail, displayName: 'Busy', passwordHash: await hash(password) },
+      });
+    });
+
+    afterAll(async () => {
+      await app.prisma.admin.deleteMany({ where: { email: busyEmail } });
+    });
+
+    it('login answers 429 RATE_LIMITED, known email or not, without spending the account budget', async () => {
+      for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT - 1; i++) {
+        expect((await login(from(freshNet()), busyEmail, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
+      }
+      const unsaturate = saturate();
+      try {
+        // One attempt short of the lockout: were any of these counted, the right password below
+        // would be refused.
+        for (let i = 0; i < 3; i++) {
+          expectRateLimited(await login(from(freshNet()), busyEmail, `wrong-guess-busy-${i}`));
+        }
+        expectRateLimited(await login(from(freshNet()), busyEmail, password));
+        expectRateLimited(await login(from(freshNet()), 'throttle-busy-ghost@example.fr', password));
+      } finally {
+        await unsaturate();
+      }
+      expect((await login(from(freshNet()), busyEmail, password)).statusCode).toBe(200);
+    });
+
+    it('change-password answers 429 RATE_LIMITED and changes nothing', async () => {
+      const ok = await login(from(freshNet()), busyEmail, password);
+      expect(ok.statusCode).toBe(200);
+      const cookies = cookiesObject(setCookieOf(ok));
+      const before = await app.prisma.admin.findUniqueOrThrow({ where: { email: busyEmail } });
+      const unsaturate = saturate();
+      try {
+        const res = await app.inject({
+          method: 'POST',
+          url: '/api/v1/auth/change-password',
+          remoteAddress: '192.0.2.250',
+          cookies,
+          payload: { currentPassword: password, newPassword: 'busy-new-pass-12' },
+        });
+        expectRateLimited(res);
+      } finally {
+        await unsaturate();
+      }
+      const after = await app.prisma.admin.findUniqueOrThrow({ where: { email: busyEmail } });
+      expect(after.passwordHash).toBe(before.passwordHash);
+      expect(after.passwordChangedAt).toEqual(before.passwordChangedAt);
+      // The session survived: no credential bump, no revocation.
+      const me = await app.inject({
+        method: 'GET',
+        url: '/api/v1/auth/me',
+        remoteAddress: '192.0.2.250',
+        cookies,
+      });
+      expect(me.statusCode).toBe(200);
+    });
   });
 });
 

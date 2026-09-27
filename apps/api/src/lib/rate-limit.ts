@@ -22,11 +22,15 @@ import { sha256 } from './api.js';
  */
 export const rateLimitKeyGenerator = (req: FastifyRequest): string => rateLimitKey(req.ip);
 
-/** A refusal the app's error handler answers with the standard RATE_LIMITED envelope. */
+/**
+ * A refusal the app's error handler answers with the standard RATE_LIMITED envelope. `retryAfter`
+ * (seconds) becomes the Retry-After header when set; @fastify/rate-limit sets its own header and
+ * leaves it undefined.
+ */
 export class RateLimitedError extends Error {
   readonly statusCode = 429;
   readonly code = 'RATE_LIMITED';
-  constructor() {
+  constructor(readonly retryAfter?: number) {
     super(errorMessage('RATE_LIMITED'));
   }
 }
@@ -74,8 +78,9 @@ export class LoginFailureTracker {
   /**
    * Counts one attempt as a failure. Called BEFORE the password is verified, so a burst of parallel
    * attempts cannot all slip past the check while their hashes run; a success then calls `reset`.
+   * Returns the end of the window the attempt was counted in, for `uncountFailure`.
    */
-  countFailure(email: string): void {
+  countFailure(email: string): number {
     const key = LoginFailureTracker.key(email);
     const now = this.now();
     const next = countLoginFailure(this.windows.get(key), now);
@@ -84,16 +89,20 @@ export class LoginFailureTracker {
     if (this.windows.size >= this.maxTracked) this.sweep(now);
     while (this.windows.size >= this.maxTracked) this.evictOne(now);
     this.windows.set(key, next);
+    return next.endsAt;
   }
 
   /**
    * Takes back the up-front count of an attempt that never got a verdict (the lookup or the hash
-   * threw, answered 500): a server fault must not spend the account's budget.
+   * threw, answered 500, or the saturated Argon2 limiter refused it, answered 429): neither spends the
+   * account's budget. `windowEndsAt` is what `countFailure` returned: an attempt counted in a window
+   * that has since expired (or been reset) is not taken back from the one that replaced it — an
+   * attacker able to delay the refusal (a queued Argon2 wait) would otherwise cancel real guesses.
    */
-  uncountFailure(email: string): void {
+  uncountFailure(email: string, windowEndsAt: number): void {
     const key = LoginFailureTracker.key(email);
     const entry = this.windows.get(key);
-    if (!entry) return;
+    if (!entry || entry.endsAt !== windowEndsAt) return;
     if (entry.failures <= 1) this.windows.delete(key);
     else this.windows.set(key, { failures: entry.failures - 1, endsAt: entry.endsAt });
   }

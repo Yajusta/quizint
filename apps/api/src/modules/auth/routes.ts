@@ -18,7 +18,7 @@ import {
   sha256,
   validationError,
 } from '../../lib/api.js';
-import { hashPassword, verifyPassword } from '../../lib/password.js';
+import { hashPassword, verifyPassword, verifyThenHash } from '../../lib/password.js';
 import { LoginFailureTracker } from '../../lib/rate-limit.js';
 import { nextCredentialVersion } from '../../plugins/auth.js';
 
@@ -66,15 +66,18 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       // Counted up front, cleared on success: parallel attempts cannot all pass the check above
       // while their hashes run.
-      loginFailures.countFailure(email);
+      const failureWindow = loginFailures.countFailure(email);
 
       const { admin, ok } = await (async () => {
         const found = await app.prisma.admin.findUnique({ where: { email } });
         // Constant-ish time: verify against the dummy hash when the admin is unknown.
         return { admin: found, ok: await verifyPassword(found?.passwordHash ?? dummyHash, password) };
       })().catch((err: unknown) => {
-        // A server fault (answered 500) is no wrong guess: give the attempt back.
-        loginFailures.uncountFailure(email);
+        // A server fault (answered 500) is no wrong guess, and neither is a refusal of the saturated
+        // Argon2 limiter (PasswordHashingBusyError, answered 429 RATE_LIMITED by the error handler —
+        // for a known and an unknown email alike, the dummy verify queuing the same way): give the
+        // attempt back, to the window it was counted in only.
+        loginFailures.uncountFailure(email, failureWindow);
         throw err;
       });
       if (!admin || !ok || !admin.isActive) {
@@ -233,14 +236,21 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       }
       const admin = await app.prisma.admin.findUnique({ where: { id: req.adminId! } });
       if (!admin) return reply.status(404).send(apiError('NOT_FOUND'));
-      const ok = await verifyPassword(admin.passwordHash, parsed.data.currentPassword);
-      if (!ok) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
+      // Verify and hash hold one Argon2 slot together: a saturated limiter (PasswordHashingBusyError,
+      // 429 RATE_LIMITED) refuses the request before the verify, whatever the current password, so a
+      // 429 never tells a right guess from a wrong one — and it comes before the update below, so a
+      // refused request changes nothing.
+      const passwordHash = await verifyThenHash(
+        admin.passwordHash,
+        parsed.data.currentPassword,
+        parsed.data.newPassword,
+      );
+      if (passwordHash === null) return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
       // passwordChangedAt is the credential version every access JWT carries: bumping it refuses all
       // the JWTs signed before, this request's own included. Conditional on the version and status read
       // above: a deactivation (or another password change) landing during the hashing already bumped
       // the version, and this request must not mint tokens under a newer one — they would come back
       // to life on reactivation.
-      const passwordHash = await hashPassword(parsed.data.newPassword);
       const passwordChangedAt = nextCredentialVersion(admin.passwordChangedAt);
       const { count } = await app.prisma.admin.updateMany({
         where: { id: admin.id, isActive: true, passwordChangedAt: admin.passwordChangedAt },
