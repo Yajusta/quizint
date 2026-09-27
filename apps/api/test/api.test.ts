@@ -6,7 +6,7 @@ import { crc32, deflateSync } from 'node:zlib';
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hash } from 'argon2';
-import { createHmac } from 'node:crypto';
+import { createHmac, randomUUID } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
@@ -1805,6 +1805,147 @@ describe('live engine', () => {
     expect(await app.prisma.participant.count({ where: { sessionId } })).toBe(0);
   });
 
+  it('a session creation racing an archive never leaves a live session on an archived quiz', async () => {
+    const req = (method: 'POST', url: string) =>
+      app.inject({ method, url: `/api/v1${url}`, cookies: cookiesObject(cookies) });
+    for (let round = 0; round < 8; round++) {
+      const quiz = await createQuiz(`Quiz course ${round}`, [mcq()]);
+      // Both in flight at once: their statements queue on the single connection and interleave.
+      const [created, archived] = await Promise.all([
+        req('POST', `/quizzes/${quiz.id}/sessions`),
+        req('POST', `/quizzes/${quiz.id}/archive`),
+      ]);
+      const row = await app.prisma.quiz.findUniqueOrThrow({
+        where: { id: quiz.id },
+        select: { archivedAt: true },
+      });
+      const sessions = await app.prisma.liveSession.findMany({
+        where: { quizId: quiz.id },
+        select: { id: true },
+      });
+      // Exactly one of them wins, and the loser is refused as if it had come second.
+      if (created.statusCode === 201) {
+        expect(archived.statusCode).toBe(409);
+        expect(row.archivedAt).toBeNull();
+        expect(sessions).toHaveLength(1);
+      } else {
+        expect(created.statusCode).toBe(404);
+        expect(archived.statusCode).toBe(204);
+        expect(row.archivedAt).not.toBeNull();
+        expect(sessions).toHaveLength(0);
+      }
+      for (const s of sessions) await app.sessionManager.deleteSession(s.id);
+      await app.prisma.quiz.delete({ where: { id: quiz.id } });
+    }
+  });
+
+  it('a session snapshot is never taken halfway through a questions save', async () => {
+    const quiz = await createQuiz('Quiz course snapshot', [mcq(), mcq({ prompt: 'Deuxième ?' })]);
+    for (let round = 0; round < 8; round++) {
+      const current = await app.inject({
+        method: 'GET',
+        url: `/api/v1/quizzes/${quiz.id}`,
+        cookies: cookiesObject(cookies),
+      });
+      const kept = (current.json().quiz.questions as Array<{ id: string }>)[0]!;
+      // Replace every question but the first: the old second one is deleted, a new one created.
+      const [created, saved] = await Promise.all([
+        app.inject({
+          method: 'POST',
+          url: `/api/v1/quizzes/${quiz.id}/sessions`,
+          cookies: cookiesObject(cookies),
+          payload: {},
+        }),
+        app.inject({
+          method: 'PUT',
+          url: `/api/v1/quizzes/${quiz.id}/questions`,
+          cookies: cookiesObject(cookies),
+          payload: {
+            questions: [mcq({ id: kept.id }), mcq({ prompt: `Nouvelle ${round} ?` })],
+          },
+        }),
+      ]);
+      expect(created.statusCode).toBe(201);
+      const sessionId = created.json().sessionId as string;
+      // Every question the snapshot names still exists: answers to it could not fail on the
+      // foreign key. A save that came second is refused (the session locks the quiz).
+      const session = await app.prisma.liveSession.findUniqueOrThrow({
+        where: { id: sessionId },
+        select: { quizSnapshot: true },
+      });
+      const snapshotIds = (
+        session.quizSnapshot as unknown as { questions: Array<{ id: string }> }
+      ).questions.map((q) => q.id);
+      expect(await app.prisma.question.count({ where: { id: { in: snapshotIds } } })).toBe(
+        snapshotIds.length,
+      );
+      expect([200, 423]).toContain(saved.statusCode);
+      await app.sessionManager.deleteSession(sessionId);
+    }
+  });
+
+  it('a duplicate never carries over a media reference its caller does not own', async () => {
+    const quiz = await createQuiz('Quiz média étranger', [mcq(), mcq({ prompt: 'Deuxième ?' })]);
+    const mediaRow = (ownerId: string) =>
+      app.prisma.media.create({
+        data: {
+          ownerId,
+          kind: 'IMAGE',
+          mimeType: 'image/webp',
+          originalName: 'x.webp',
+          storageKey: `${randomUUID()}.webp`,
+          sizeBytes: 1,
+        },
+      });
+    const me = await app.prisma.admin.findUniqueOrThrow({ where: { email: TEST_EMAIL } });
+    const own = await mediaRow(me.id);
+    const foreign = await mediaRow(randomUUID());
+    // A reference the questions PUT would refuse, written straight to the rows (legacy data).
+    const [q0, q1] = quiz.questions;
+    await app.prisma.question.update({ where: { id: q0!.id }, data: { mediaId: foreign.id } });
+    await app.prisma.question.update({ where: { id: q1!.id }, data: { mediaId: own.id } });
+    await app.prisma.choice.update({ where: { id: q0!.choices[0]!.id }, data: { mediaId: foreign.id } });
+    await app.prisma.choice.update({ where: { id: q1!.choices[0]!.id }, data: { mediaId: own.id } });
+
+    const dup = await app.inject({
+      method: 'POST',
+      url: `/api/v1/quizzes/${quiz.id}/duplicate`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(dup.statusCode).toBe(201);
+    const copy = await app.prisma.question.findMany({
+      where: { quizId: dup.json().quiz.id as string },
+      orderBy: { position: 'asc' },
+      include: { choices: { orderBy: { position: 'asc' } } },
+    });
+    expect(copy.map((q) => q.mediaId)).toEqual([null, own.id]);
+    expect(copy.map((q) => q.choices[0]!.mediaId)).toEqual([null, own.id]);
+    // The copy saves as-is: nothing the PUT would refuse was carried over.
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${dup.json().quiz.id as string}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: {
+        questions: copy.map((q) => ({
+          id: q.id,
+          type: q.type,
+          prompt: q.prompt,
+          mediaId: q.mediaId,
+          pointsCorrect: q.pointsCorrect,
+          pointsWrong: q.pointsWrong,
+          timeLimitSec: q.timeLimitSec,
+          choices: q.choices.map((c) => ({
+            id: c.id,
+            label: c.label,
+            isCorrect: c.isCorrect,
+            mediaId: c.mediaId,
+          })),
+        })),
+      },
+    });
+    expect(put.statusCode).toBe(200);
+  });
+
   it('closing a question re-sends the participants list with the updated scores', async () => {
     const quiz = await createQuiz('Quiz scores panneau', [mcq()]);
     const { code, s } = await createLiveSession(quiz.id);
@@ -2092,10 +2233,13 @@ describe('live engine', () => {
     // The check has run (no session, nothing answered); a session opens before the transaction.
     const real = app.prisma;
     let sessionId = '';
+    let armed = true;
     const racing = new Proxy(real, {
       get(target, key) {
-        if (key !== '$transaction') return bound(target, key);
+        if (key !== '$transaction' || !armed) return bound(target, key);
         return async (arg: unknown) => {
+          // Once: the session creation runs its own transaction through this same client.
+          armed = false;
           const session = await createLiveSession(quiz.id);
           sessionId = session.sessionId;
           return (target.$transaction as (a: unknown) => Promise<unknown>).call(target, arg);

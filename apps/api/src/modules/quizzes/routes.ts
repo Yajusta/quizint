@@ -209,13 +209,23 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
     '/quizzes/:id/archive',
     { preHandler: app.authenticate },
     async (req, reply) => {
+      // Check and write in one conditional statement: a session created between a bare check and
+      // the update would be left running on an archived quiz. The session creation reads the quiz
+      // in its own transaction, so one of the two always sees the other's outcome.
+      const { count } = await app.prisma.quiz.updateMany({
+        where: {
+          id: req.params.id,
+          ownerId: req.adminId!,
+          archivedAt: null,
+          sessions: { none: { phase: { not: 'ENDED' } } },
+        },
+        data: { archivedAt: new Date() },
+      });
+      if (count > 0) return reply.status(204).send();
+      // Nothing archived: tell a missing quiz from one a session still runs on.
       const quiz = await getOwnedQuizHead(req.params.id, req.adminId!);
       if (!quiz) return reply.status(404).send(apiError('NOT_FOUND'));
-      if (await hasLiveSession(quiz.id)) {
-        return reply.status(409).send(apiError('QUIZ_HAS_SESSION_IN_PROGRESS'));
-      }
-      await app.prisma.quiz.update({ where: { id: quiz.id }, data: { archivedAt: new Date() } });
-      return reply.status(204).send();
+      return reply.status(409).send(apiError('QUIZ_HAS_SESSION_IN_PROGRESS'));
     },
   );
 
@@ -265,6 +275,12 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const quiz = await getOwnedQuiz(req.params.id, req.adminId!);
       if (!quiz) return reply.status(404).send(apiError('NOT_FOUND'));
+      // Same owner rule as the questions PUT and the import: only this admin's uploads carry over.
+      // The PUT refuses a foreign media id, but a row written before that check (or by hand) may
+      // still hold one; the copy drops it, like the import, rather than launder it into a new quiz.
+      // Refusing instead would take away duplication, the escape hatch of a played quiz.
+      const ownMediaId = (id: string | null, media: MediaRow): string | null =>
+        id !== null && media?.ownerId === req.adminId ? id : null;
       const copy = await app.prisma.quiz.create({
         data: {
           ownerId: req.adminId!,
@@ -276,7 +292,7 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
               position: q.position,
               type: q.type,
               prompt: q.prompt,
-              mediaId: q.mediaId,
+              mediaId: ownMediaId(q.mediaId, q.media),
               mediaOnParticipants: q.mediaOnParticipants,
               pointsCorrect: q.pointsCorrect,
               pointsWrong: q.pointsWrong,
@@ -287,7 +303,7 @@ export async function quizRoutes(app: FastifyInstance): Promise<void> {
                 create: q.choices.map((c) => ({
                   position: c.position,
                   label: c.label,
-                  mediaId: c.mediaId,
+                  mediaId: ownMediaId(c.mediaId, c.media),
                   isCorrect: c.isCorrect,
                 })),
               },

@@ -449,7 +449,7 @@ export function QuizEditorPage() {
   };
 
   const exportJson = () => {
-    if (quizId) window.open(apiPath`/api/v1/quizzes/${quizId}/export`, '_blank', 'noopener');
+    if (quizId) window.open(apiPath`/api/v1/quizzes/${quizId}/export`, '_blank', 'noopener,noreferrer');
   };
 
   const discardDraft = () => {

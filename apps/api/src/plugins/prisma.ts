@@ -18,6 +18,13 @@ declare module 'fastify' {
 // out of the picture under the answer bursts of a live session.
 const PRAGMAS = ['PRAGMA journal_mode = WAL', 'PRAGMA synchronous = NORMAL', 'PRAGMA busy_timeout = 5000'];
 
+/**
+ * Options for an interactive `$transaction` on a request path. maxWait matches the pool timeout of a
+ * plain query: on the single connection a busy live session must delay the transaction, not fail it
+ * after Prisma's default 2 s.
+ */
+export const REQUEST_TX_OPTIONS = { maxWait: 10_000 } as const;
+
 export const prismaPlugin = fp(
   async (app: FastifyInstance) => {
     const prisma = new PrismaClient();

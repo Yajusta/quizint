@@ -119,7 +119,7 @@ export function SessionDetailPage() {
   }, [id, navigate, t]);
 
   const exportCsv = (kind: 'scores' | 'answers') => {
-    window.open(apiPath`/api/v1/sessions/${id}/export.csv?kind=${kind}`, '_blank');
+    window.open(apiPath`/api/v1/sessions/${id}/export.csv?kind=${kind}`, '_blank', 'noopener,noreferrer');
   };
 
   if (error) {

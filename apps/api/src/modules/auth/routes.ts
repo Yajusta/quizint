@@ -21,6 +21,7 @@ import {
 import { hashPassword, verifyPassword, verifyThenHash } from '../../lib/password.js';
 import { LoginFailureTracker } from '../../lib/rate-limit.js';
 import { nextCredentialVersion } from '../../plugins/auth.js';
+import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
 
 function toAdminDTO(a: {
   id: string;
@@ -185,22 +186,23 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       // tokens under the old version. The version is read in the transaction and moved strictly past
       // it, so a password change committed in the same millisecond cannot end up sharing it.
       // Reactivation does not bump: nothing is live to revoke.
-      const admin = await app.prisma.$transaction(async (tx) => {
-        const current = deactivating
-          ? await tx.admin.findUniqueOrThrow({
+      // Anything else is a single update, off the transaction.
+      const data = {
+        ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
+        ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
+      };
+      const admin = deactivating
+        ? await app.prisma.$transaction(async (tx) => {
+            const current = await tx.admin.findUniqueOrThrow({
               where: { id: req.params.id },
               select: { passwordChangedAt: true },
-            })
-          : null;
-        return tx.admin.update({
-          where: { id: req.params.id },
-          data: {
-            ...(parsed.data.displayName !== undefined ? { displayName: parsed.data.displayName } : {}),
-            ...(parsed.data.isActive !== undefined ? { isActive: parsed.data.isActive } : {}),
-            ...(current ? { passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) } : {}),
-          },
-        });
-      });
+            });
+            return tx.admin.update({
+              where: { id: req.params.id },
+              data: { ...data, passwordChangedAt: nextCredentialVersion(current.passwordChangedAt) },
+            });
+          }, REQUEST_TX_OPTIONS)
+        : await app.prisma.admin.update({ where: { id: req.params.id }, data });
       // A deactivation ends the account's sessions, whoever holds them. There is no password field
       // here (AdminPatchInput is strict): nobody resets a colleague's password.
       if (deactivating) {

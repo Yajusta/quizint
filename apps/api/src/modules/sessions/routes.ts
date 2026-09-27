@@ -19,6 +19,7 @@ import {
 import type { Env } from '../../config.js';
 import { asMediaKind, asPhase, asQuestionType } from '../../db/enums.js';
 import { apiError, joinUrl, slugify, validationError } from '../../lib/api.js';
+import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
 import { storedPlayedQuestionIds } from '../quizzes/played.js';
 import { buildAnswersCsv, buildScoresCsv } from './csv.js';
 
@@ -86,7 +87,7 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
       const merged = [...new Set([...stored, ...answered.map((a) => a.questionId)])];
       if (merged.length === stored.length) return;
       await tx.quiz.update({ where: { id: quizId }, data: { playedQuestionIds: merged } });
-    });
+    }, REQUEST_TX_OPTIONS);
   };
 
   const toSnapshotMedia = (
@@ -113,86 +114,102 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     '/quizzes/:id/sessions',
     { preHandler: app.authenticate },
     async (req, reply) => {
-      const quiz = await app.prisma.quiz.findFirst({
-        where: { id: req.params.id, ownerId: req.adminId!, archivedAt: null },
-        include: {
-          questions: {
-            orderBy: { position: 'asc' },
-            include: {
-              choices: { orderBy: { position: 'asc' }, include: { media: true } },
-              media: true,
+      const config = app.config;
+      // Read, snapshot and insert in one transaction: on the single connection nothing else runs
+      // in between, so an archive (refused while a session is not over) or a questions save (which
+      // may delete questions a snapshot names) lands either wholly before — the read sees it — or
+      // wholly after, when the new session already blocks it.
+      const outcome = await app.prisma.$transaction(async (tx) => {
+        const quiz = await tx.quiz.findFirst({
+          where: { id: req.params.id, ownerId: req.adminId!, archivedAt: null },
+          include: {
+            questions: {
+              orderBy: { position: 'asc' },
+              include: {
+                choices: { orderBy: { position: 'asc' }, include: { media: true } },
+                media: true,
+              },
             },
           },
-        },
-      });
-      if (!quiz) return reply.status(404).send(apiError('NOT_FOUND'));
-      if (quiz.questions.length === 0) {
-        return reply.status(409).send(apiError('VALIDATION', 'un quiz nécessite au moins une question'));
-      }
-
-      const config = app.config;
-      const snapshot = buildQuizSnapshot(
-        {
-          id: quiz.id,
-          title: quiz.title,
-          description: quiz.description,
-          questions: quiz.questions.map((q) => ({
-            id: q.id,
-            position: q.position,
-            type: asQuestionType(q.type),
-            prompt: q.prompt,
-            mediaOnParticipants: q.mediaOnParticipants,
-            pointsCorrect: q.pointsCorrect,
-            pointsWrong: q.pointsWrong,
-            timeLimitSec: q.timeLimitSec,
-            speedBonusMax: q.speedBonusMax,
-            numericAnswer: q.numericAnswer as never,
-            media: toSnapshotMedia(q.media),
-            choices: q.choices.map((c) => ({
-              id: c.id,
-              position: c.position,
-              label: c.label,
-              isCorrect: c.isCorrect,
-              media: toSnapshotMedia(c.media),
-            })),
-          })),
-        },
-        config.PUBLIC_URL,
-      );
-
-      // Unique global code — retry on collision (5 attempts max).
-      let code = '';
-      for (let attempt = 0; attempt < 5; attempt++) {
-        const candidate = generateSessionCode();
-        const exists = await app.prisma.liveSession.findUnique({
-          where: { code: candidate },
-          select: { id: true },
         });
-        if (!exists) {
-          code = candidate;
-          break;
+        if (!quiz) return { error: 'NOT_FOUND' } as const;
+        if (quiz.questions.length === 0) return { error: 'EMPTY_QUIZ' } as const;
+
+        const snapshot = buildQuizSnapshot(
+          {
+            id: quiz.id,
+            title: quiz.title,
+            description: quiz.description,
+            questions: quiz.questions.map((q) => ({
+              id: q.id,
+              position: q.position,
+              type: asQuestionType(q.type),
+              prompt: q.prompt,
+              mediaOnParticipants: q.mediaOnParticipants,
+              pointsCorrect: q.pointsCorrect,
+              pointsWrong: q.pointsWrong,
+              timeLimitSec: q.timeLimitSec,
+              speedBonusMax: q.speedBonusMax,
+              numericAnswer: q.numericAnswer as never,
+              media: toSnapshotMedia(q.media),
+              choices: q.choices.map((c) => ({
+                id: c.id,
+                position: c.position,
+                label: c.label,
+                isCorrect: c.isCorrect,
+                media: toSnapshotMedia(c.media),
+              })),
+            })),
+          },
+          config.PUBLIC_URL,
+        );
+
+        // Unique global code — retry on collision (5 attempts max).
+        let code = '';
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const candidate = generateSessionCode();
+          const exists = await tx.liveSession.findUnique({
+            where: { code: candidate },
+            select: { id: true },
+          });
+          if (!exists) {
+            code = candidate;
+            break;
+          }
+        }
+        if (!code) return { error: 'CODE_GENERATION' } as const;
+
+        const quizSettings = quiz.settings as Record<string, unknown>;
+        const settings: LiveSessionSettings = {
+          showIntermediateRanking: quizSettings.showIntermediateRanking !== false,
+          showParticipantAnswers: quizSettings.showParticipantAnswers === true,
+        };
+
+        const session = await tx.liveSession.create({
+          data: {
+            code,
+            quizId: quiz.id,
+            presenterId: req.adminId!,
+            quizSnapshot: snapshot as unknown as object,
+            settings,
+            phase: 'LOBBY',
+          },
+          // Not the whole row: it would read back and parse the snapshot just written.
+          select: { id: true, code: true },
+        });
+        return { session } as const;
+      }, REQUEST_TX_OPTIONS);
+      if ('error' in outcome) {
+        switch (outcome.error) {
+          case 'NOT_FOUND':
+            return reply.status(404).send(apiError('NOT_FOUND'));
+          case 'EMPTY_QUIZ':
+            return reply.status(409).send(apiError('VALIDATION', 'un quiz nécessite au moins une question'));
+          case 'CODE_GENERATION':
+            return reply.status(500).send(apiError('INTERNAL', 'code generation failed'));
         }
       }
-      if (!code) return reply.status(500).send(apiError('INTERNAL', 'code generation failed'));
-
-      const quizSettings = quiz.settings as Record<string, unknown>;
-      const settings: LiveSessionSettings = {
-        showIntermediateRanking: quizSettings.showIntermediateRanking !== false,
-        showParticipantAnswers: quizSettings.showParticipantAnswers === true,
-      };
-
-      const session = await app.prisma.liveSession.create({
-        data: {
-          code,
-          quizId: quiz.id,
-          presenterId: req.adminId!,
-          quizSnapshot: snapshot as unknown as object,
-          settings,
-          phase: 'LOBBY',
-        },
-        // Not the whole row: it would read back and parse the snapshot just written.
-        select: { id: true, code: true },
-      });
+      const { session } = outcome;
 
       return reply.status(201).send({
         sessionId: session.id,

@@ -16,6 +16,7 @@ import {
   sha256,
   type AdminJwtPayload,
 } from '../lib/api.js';
+import { REQUEST_TX_OPTIONS } from './prisma.js';
 
 const ACCESS_TTL_SEC = 15 * 60; // 15 min
 const REFRESH_TTL_SEC = 7 * 24 * 60 * 60; // 7 days
@@ -218,23 +219,19 @@ async function plugin(app: FastifyInstance): Promise<void> {
       if (previousId) {
         // Revoke and create in one transaction: a revokeAdminSessions sweep can no longer land
         // between them and miss the successor (the version check in verifyRefreshToken is the second
-        // line). maxWait matches the pool timeout of a plain query: on the single connection a busy
-        // live session must delay a refresh, not fail it after Prisma's default 2 s.
-        const minted = await app.prisma.$transaction(
-          async (tx) => {
-            // Only a live token gets a revocation time: re-stamping an already revoked one on every
-            // replay would slide the grace window and let a replayed token mint sessions forever.
-            // Conditional on `revokedAt: null`, so the single-writer database decides the one winner.
-            const { count } = await tx.refreshToken.updateMany({
-              where: { id: previousId, revokedAt: null },
-              data: { revokedAt: new Date() },
-            });
-            if (count === 0) return false;
-            await tx.refreshToken.create({ data });
-            return true;
-          },
-          { maxWait: 10_000 },
-        );
+        // line).
+        const minted = await app.prisma.$transaction(async (tx) => {
+          // Only a live token gets a revocation time: re-stamping an already revoked one on every
+          // replay would slide the grace window and let a replayed token mint sessions forever.
+          // Conditional on `revokedAt: null`, so the single-writer database decides the one winner.
+          const { count } = await tx.refreshToken.updateMany({
+            where: { id: previousId, revokedAt: null },
+            data: { revokedAt: new Date() },
+          });
+          if (count === 0) return false;
+          await tx.refreshToken.create({ data });
+          return true;
+        }, REQUEST_TX_OPTIONS);
         if (!minted) return null;
       } else {
         await app.prisma.refreshToken.create({ data });
