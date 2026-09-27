@@ -87,9 +87,23 @@ export function nextCredentialVersion(current: Date | null): Date {
  * credential version is `admin.passwordChangedAt` by construction, so it is not repeated here.
  */
 export interface RefreshTokenCheck {
+  ok: true;
   id: string;
   admin: Admin;
 }
+
+/**
+ * A refresh token `verifyRefreshToken` refused. `reuse`: a rotated token replayed beyond the grace,
+ * the one refusal with a side effect (every live token of the admin revoked, again on every replay).
+ * `dead`: anything else — no cookie, unknown, expired or swept, older credential version, inactive
+ * admin — refused again, and inertly, on every replay.
+ */
+export interface RefreshTokenRefusal {
+  readonly ok: false;
+  readonly reason: 'dead' | 'reuse';
+}
+
+export type RefreshTokenResult = RefreshTokenCheck | RefreshTokenRefusal;
 
 function cookieOpts(maxAge: number) {
   return {
@@ -267,20 +281,21 @@ async function plugin(app: FastifyInstance): Promise<void> {
   });
 
   // Verify a refresh token and detect reuse of a revoked one (→ revoke the whole family).
-  app.decorate('verifyRefreshToken', async (req: FastifyRequest): Promise<RefreshTokenCheck | null> => {
+  const dead: RefreshTokenRefusal = Object.freeze({ ok: false, reason: 'dead' });
+  app.decorate('verifyRefreshToken', async (req: FastifyRequest): Promise<RefreshTokenResult> => {
     const token = req.cookies[REFRESH_TOKEN_COOKIE];
-    if (!token) return null;
+    if (!token) return dead;
     const row = await app.prisma.refreshToken.findUnique({ where: { tokenHash: sha256(token) } });
     // Dead at its exact expiry instant: logout and revokeAdminSessions set `expiresAt = revokedAt`,
     // and a strict `<` would let that token through (into the grace path) within the same millisecond.
-    if (!row || row.expiresAt.getTime() <= Date.now()) return null;
+    if (!row || row.expiresAt.getTime() <= Date.now()) return dead;
     // A family opened under an older credential version (a password change or a deactivation since),
     // or of an inactive admin, is dead whatever the sweep caught (a rotation racing it may have left a
     // live successor). Checked before the reuse branch: a token rotated before a password change is
     // not a theft signal about the sessions opened since, and replaying it must not revoke them.
     const admin = await app.prisma.admin.findUnique({ where: { id: row.adminId } });
     if (!admin?.isActive || !sameCredentialVersion(row.credentialVersion, admin.passwordChangedAt)) {
-      return null;
+      return dead;
     }
     // The grace is [revokedAt, revokedAt + GRACE): at its end instant a replay is already reuse.
     if (row.revokedAt && Date.now() - row.revokedAt.getTime() >= REFRESH_ROTATION_GRACE_MS) {
@@ -291,11 +306,11 @@ async function plugin(app: FastifyInstance): Promise<void> {
         where: { adminId: row.adminId, revokedAt: null },
         data: { revokedAt: at, expiresAt: at },
       });
-      return null;
+      return { ok: false, reason: 'reuse' };
     }
     // Fresh, or revoked within the grace window by a concurrent rotation: the caller issues an access
     // token, and issueRefreshToken mints a successor only for a token that was still live.
-    return { id: row.id, admin };
+    return { ok: true, id: row.id, admin };
   });
 
   app.decorate('clearAuthCookies', (reply: FastifyReply) => {
@@ -324,7 +339,7 @@ declare module 'fastify' {
      * The one refresh-token check: row found and unexpired, admin active, row's credential version
      * equal to the admin's, and reuse of a rotated token beyond the grace (→ family revoked).
      */
-    verifyRefreshToken: (req: FastifyRequest) => Promise<RefreshTokenCheck | null>;
+    verifyRefreshToken: (req: FastifyRequest) => Promise<RefreshTokenResult>;
     revokeAdminSessions: (adminId: string) => Promise<void>;
     clearAuthCookies: (reply: FastifyReply) => void;
   }

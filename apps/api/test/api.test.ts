@@ -4,12 +4,13 @@
 
 import { crc32, deflateSync } from 'node:zlib';
 
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { hash } from 'argon2';
 import { createHmac, randomUUID } from 'node:crypto';
 
 import {
   ADMIN_PASSWORD_MAX_LENGTH,
+  API_REQUESTS_PER_MINUTE,
   ARGON2_MAX_CONCURRENCY,
   ARGON2_MAX_QUEUE,
   AUTO_CLOSE_RETRY_BASE_MS,
@@ -1156,6 +1157,45 @@ describe('refresh token credential version', () => {
     expect(hasCookie(next, 'refresh_token')).toBe(true);
   });
 
+  it('a refresh racing a password change in the same browser does not clear the new cookies', async () => {
+    // Its own admin: the shared one's per-admin change-password budget is already spent by the others.
+    const lateEmail = 'late-refresh@example.fr';
+    const { id: lateId } = await app.prisma.admin.create({
+      data: { email: lateEmail, displayName: 'Late', passwordHash: await hash(password) },
+    });
+    onTestFinished(() => app.prisma.admin.delete({ where: { id: lateId } }).then(() => undefined));
+    const session = await login(lateEmail);
+    // The refresh left with the pre-change cookie, change-password answered first: the refusal lands
+    // last in the browser, and must not overwrite the cookies change-password just set.
+    const fresh = await changePassword(session);
+    const late = await refresh(session);
+    expect(late.statusCode).toBe(401);
+    expect(late.cookies).toEqual([]);
+    expect(late.headers['set-cookie']).toBeUndefined();
+    // Nothing minted, and the dead cookie stays dead however often it is replayed, with no side effect:
+    // the sessions opened by the change are untouched.
+    expect((await refresh(session)).cookies).toEqual([]);
+    expect((await me(fresh)).statusCode).toBe(200);
+    expect((await refresh(fresh)).statusCode).toBe(200);
+  });
+
+  it('a refused reuse of a rotated token clears the cookies', async () => {
+    const first = await login();
+    expect((await refresh(first)).statusCode).toBe(200);
+    // Rotated a minute ago, beyond the grace: reuse, which revokes every live token of the admin — the
+    // browser must not keep the cookie and repeat that on each of its refreshes.
+    await app.prisma.refreshToken.update({
+      where: { tokenHash: sha256(first.refresh_token!) },
+      data: { revokedAt: new Date(Date.now() - 60_000) },
+    });
+    const reuse = await refresh(first);
+    expect(reuse.statusCode).toBe(401);
+    expect(Object.fromEntries(reuse.cookies.map((c) => [c.name, c.value]))).toEqual({
+      access_token: '',
+      refresh_token: '',
+    });
+  });
+
   it('a refresh chain racing a password change never survives it', async () => {
     // A fresh admin per round: change-password allows CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE per admin,
     // and twenty changes of one account within a minute would be (rightly) throttled.
@@ -1431,6 +1471,31 @@ describe('change-password rate limit', { timeout: ARGON2_HEAVY_TEST_TIMEOUT_MS }
     }
     // Same address, a valid session of another admin: its own, untouched budget.
     expect((await changePassword('192.0.2.204', password, bystander)).statusCode).toBe(204);
+  });
+
+  it('requests refused by authenticate still draw on the per-address bucket', async () => {
+    // The per-admin limit replaces the global limiter on this route: without the explicit per-address
+    // hook, a token-less flood would never be capped at all.
+    const flooder = '192.0.2.205';
+    for (let sent = 0; sent < API_REQUESTS_PER_MINUTE; sent += 200) {
+      const batch = await Promise.all(
+        Array.from({ length: Math.min(200, API_REQUESTS_PER_MINUTE - sent) }, () =>
+          changePassword(flooder, password),
+        ),
+      );
+      expect(batch.every((r) => r.statusCode === 401)).toBe(true);
+    }
+    const blocked = await changePassword(flooder, password);
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.json().error.code).toBe('RATE_LIMITED');
+    expect(Number(blocked.headers['retry-after'])).toBeGreaterThan(0);
+    expect(Number(blocked.headers['x-ratelimit-limit'])).toBe(API_REQUESTS_PER_MINUTE);
+    expect(blocked.headers['x-ratelimit-remaining']).toBe('0');
+    // The one global bucket of that address: its other routes are refused too.
+    const me = await app.inject({ method: 'GET', url: '/api/v1/auth/me', remoteAddress: flooder });
+    expect(me.statusCode).toBe(429);
+    // Another address is untouched.
+    expect((await changePassword('192.0.2.206', password)).statusCode).toBe(401);
   });
 });
 

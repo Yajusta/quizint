@@ -1,7 +1,9 @@
 // REST rate-limit wiring: the per-address key, the 429 envelope, and the per-account login failure
 // store (the socket guards key on the same shared rateLimitKey). The rules themselves live in @quiz/shared (rate-limit.ts).
 
-import type { FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyRequest, onRequestAsyncHookHandler } from 'fastify';
+// Type-only: the `createRateLimit` decorator's declaration.
+import type {} from '@fastify/rate-limit';
 
 import {
   LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX,
@@ -41,6 +43,28 @@ export class RateLimitedError extends Error {
  * looks for — instead of Fastify's default error body. Route-level configs inherit it.
  */
 export const rateLimitErrorResponse = (): RateLimitedError => new RateLimitedError();
+
+/**
+ * An onRequest hook drawing on the global per-address bucket (the very store and key of the global
+ * limiter, API_REQUESTS_PER_MINUTE), for a route whose own `config.rateLimit` replaced it: with
+ * @fastify/rate-limit, a route-level config is the route's only limiter. `createRateLimit()` without
+ * options is the global limiter itself, and unlike `app.rateLimit()` it does not set the per-request
+ * "already limited" flag, which would make the route's own limiter skip the request.
+ * `app` must be inside the context the plugin is registered in.
+ */
+export function globalAddressLimit(app: FastifyInstance): onRequestAsyncHookHandler {
+  const check = app.createRateLimit();
+  return async (req, reply) => {
+    const res = await check(req);
+    if (res.isAllowed || !res.isExceeded) return;
+    // The headers the global limiter sends on its own 429 (Retry-After comes from the error handler).
+    // Only on the refusal: an allowed request reports the route's own limiter, which runs later.
+    reply.header('x-ratelimit-limit', res.max);
+    reply.header('x-ratelimit-remaining', 0);
+    reply.header('x-ratelimit-reset', res.ttlInSeconds);
+    throw new RateLimitedError(res.ttlInSeconds);
+  };
+}
 
 /**
  * Failed login attempts per account (in memory: a single API process, see CLAUDE.md). Keys are a hash

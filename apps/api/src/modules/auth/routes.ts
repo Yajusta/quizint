@@ -19,7 +19,7 @@ import {
   validationError,
 } from '../../lib/api.js';
 import { hashPassword, verifyPassword, verifyThenHash } from '../../lib/password.js';
-import { LoginFailureTracker } from '../../lib/rate-limit.js';
+import { LoginFailureTracker, globalAddressLimit } from '../../lib/rate-limit.js';
 import { nextCredentialVersion } from '../../plugins/auth.js';
 import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
 
@@ -99,8 +99,20 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     // may have minted a live successor): such a row gets nothing, not even the access token of the
     // grace path below.
     const check = await app.verifyRefreshToken(req);
-    if (!check) {
-      app.clearAuthCookies(reply);
+    if (!check.ok) {
+      // A refusal mints nothing either way; what it may do is clear the cookies, and the server
+      // cannot see the browser's jar, only the cookie this request carried. A request sent before a
+      // change-password (or a login in another tab) answered can land after it, and its Set-Cookie
+      // clearing would wipe the fresh cookies that response just set, signing the admin out. So a
+      // `dead` refusal leaves the cookies alone: replaying a dead token is inert (refused again, no
+      // side effect), and the client ends on the login page all the same — it tries one refresh per
+      // 401, and every protected request answers 401 with or without the dead cookies.
+      // A `reuse` refusal still clears them: that replay revokes every live token of the admin, and a
+      // browser left holding the token would repeat it on each refresh (the presenter view refreshes
+      // every 10 min), signing the admin out of each new device session in turn. It is not always a
+      // theft: a rotation whose response was lost leaves the rotated token in this very jar, and its
+      // next refresh is reuse all the same — once, since the clear takes the token out of the jar.
+      if (check.reason === 'reuse') app.clearAuthCookies(reply);
       return reply.status(401).send(apiError('UNAUTHORIZED'));
     }
     const { admin } = check;
@@ -218,9 +230,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // claim. Keyed on the admin, a stolen cookie gets the same budget from any IP. A request without a
   // valid token stops at authenticate's 401 and never touches the store: it cannot evict an admin's
   // bucket from the LRU, and an expired token still gets the 401 the client refreshes on, not a 429.
+  // That route-level config replaces the global per-address limiter on this route, so the onRequest
+  // hook draws on the global bucket explicitly: requests refused by authenticate (no, forged or
+  // revoked token) stay capped per address like on any other route.
   app.post(
     '/auth/change-password',
     {
+      onRequest: globalAddressLimit(app),
       preHandler: app.authenticate,
       config: {
         rateLimit: {

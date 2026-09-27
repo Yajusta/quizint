@@ -64,6 +64,9 @@ export const ADMIN_PASSWORD_MAX_LENGTH = 256;
 // (and turn a temporary theft into a takeover) by rotating IPs.
 export const LOGIN_ATTEMPTS_PER_MINUTE = 10;
 export const CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE = 5;
+// The global REST bucket, per client address, of every /api route without a limit of its own (a
+// route-level limit replaces it; change-password draws on it explicitly as well, see its route).
+export const API_REQUESTS_PER_MINUTE = 2000;
 /**
  * HS256 signing secret of the admin JWTs (`JWT_SECRET`, checked by apps/api/src/config.ts). Length
  * alone does not make a secret: on top of the minimum length, a secret with fewer than
