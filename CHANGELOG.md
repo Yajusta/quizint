@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 (2026-09-27)
 
 Security audit remediation. Two new migrations (`20260926110000_admin_password_changed_at`, `20260926120000_quiz_played_question_ids`), applied by `prisma migrate deploy` at container start.
 
