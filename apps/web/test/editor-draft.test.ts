@@ -3,7 +3,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { DRAFT_TTL_MS, draftKey, readDraft, writeDraft } from '../src/pages/admin/editor/model.ts';
+import {
+  DRAFT_TTL_MS,
+  draftKey,
+  lateDraftToOffer,
+  readDraft,
+  writeDraft,
+} from '../src/pages/admin/editor/model.ts';
 
 const ADMIN_A = '00000000-0000-4000-8000-00000000000a';
 const ADMIN_B = '00000000-0000-4000-8000-00000000000b';
@@ -69,6 +75,54 @@ describe.each([
   it('drops an unreadable draft', () => {
     localStorage.setItem(key, '{not json');
     expect(readDraft(key, ADMIN_A)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+});
+
+// `/auth/me` failed at load, so the stored draft was never offered; a later retry confirms the admin
+// while the screen is already edited. The first autosave must not overwrite that draft unseen.
+describe('late-confirmed draft owner', () => {
+  const key = draftKey(QUIZ_ID);
+  const stored = { title: 'Capitales', description: 'Europe', questions: [] };
+  const edited = { title: 'Capitale', description: '', questions: [] };
+  const saved = { title: 'Capitale', description: '', questions: '[]' };
+
+  it('offers the admin their own stored draft when it differs from the screen', () => {
+    writeDraft(key, ADMIN_A, stored);
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, saved)).toMatchObject({
+      ...stored,
+      author: ADMIN_A,
+    });
+  });
+
+  it('offers nothing when the stored draft matches the screen (whitespace aside)', () => {
+    writeDraft(key, ADMIN_A, stored);
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), { ...stored, title: ' Capitales ' }, saved)).toBeNull();
+  });
+
+  it('offers nothing when no draft is stored, or an empty one', () => {
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, saved)).toBeNull();
+    writeDraft(key, ADMIN_A, { title: '', description: 'Seule', questions: [] });
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, saved)).toBeNull();
+  });
+
+  it('offers nothing when the stored draft equals the saved version', () => {
+    writeDraft(key, ADMIN_A, stored);
+    const same = { title: 'Capitales', description: 'Europe', questions: '[]' };
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, same)).toBeNull();
+  });
+
+  it('offers nothing for a malformed draft of an older shape, instead of throwing', () => {
+    localStorage.setItem(
+      key,
+      JSON.stringify({ ...stored, questions: [{ key: 'q1' }], at: Date.now(), author: ADMIN_A }),
+    );
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, saved)).toBeNull();
+  });
+
+  it('never offers a draft written by another admin, which is removed on read', () => {
+    writeDraft(key, ADMIN_B, stored);
+    expect(lateDraftToOffer(readDraft(key, ADMIN_A), edited, saved)).toBeNull();
     expect(localStorage.getItem(key)).toBeNull();
   });
 });

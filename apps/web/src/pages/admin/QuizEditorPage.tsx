@@ -29,12 +29,14 @@ import {
   clearDraft,
   draftKey,
   fromServerQuestion,
+  lateDraftToOffer,
   newQuestion,
   readDraft,
   serialize,
   toServerQuestion,
   validateQuestion,
   writeDraft,
+  type Draft,
   type EditorQuestion,
 } from './editor/model.ts';
 
@@ -101,6 +103,10 @@ export function QuizEditorPage() {
   const [draftRestored, setDraftRestored] = useState(false);
   /** Admin the local draft belongs to (`/auth/me`); `null` until confirmed — no draft is written then. */
   const [draftOwner, setDraftOwner] = useState<string | null>(null);
+  /** Stored draft found once the owner was confirmed late: offered, and never overwritten meanwhile. */
+  const [lateDraft, setLateDraft] = useState<Draft | null>(null);
+  /** Bumped on every load: a late owner lookup started before it is ignored. */
+  const loadGen = useRef(0);
   const [error, setError] = useState<EditorError | null>(null);
   const [saving, setSaving] = useState(false);
   const [launching, setLaunching] = useState(false);
@@ -143,6 +149,8 @@ export function QuizEditorPage() {
     setAttempted(false);
     setTouched(new Set());
     setDraftRestored(false);
+    setLateDraft(null);
+    loadGen.current += 1;
     setRightTab('settings');
     setLoading(true);
     // Drafts are bound to the admin the server confirms: nothing is restored before that answer,
@@ -242,26 +250,45 @@ export function QuizEditorPage() {
   const currentDraftKey = draftKey(quizId);
   /** Earliest time to ask `/auth/me` again after it failed at load: the draft safety net comes back. */
   const ownerRetryAt = useRef(0);
+  /** What the screen holds now, read when a late owner lookup answers. */
+  const screen = { key: currentDraftKey, title, description, questions, baseline };
+  const onScreen = useRef(screen);
+  onScreen.current = screen;
   useEffect(() => {
     if (loading) return;
     if (!draftOwner) {
       if (dirty && Date.now() >= ownerRetryAt.current) {
         ownerRetryAt.current = Date.now() + 30_000;
+        const gen = loadGen.current;
         fetchDraftOwner().then(
           (me) => {
-            if (me) setDraftOwner(me);
+            if (!me || gen !== loadGen.current) return;
+            // The load path never offered this admin's stored draft: offer it before any write.
+            const now = onScreen.current;
+            setLateDraft(lateDraftToOffer(readDraft(now.key, me), now, now.baseline));
+            setDraftOwner(me);
           },
           () => undefined, // a 401 surfaces on the next save
         );
       }
       return;
     }
+    if (lateDraft) return; // the stored draft stays untouched until the admin picks a version
     if (!dirty) {
       clearDraft(currentDraftKey);
       return;
     }
     writeDraft(currentDraftKey, draftOwner, { title, description, questions });
-  }, [loading, draftOwner, dirty, currentDraftKey, title, description, questions]);
+  }, [loading, draftOwner, lateDraft, dirty, currentDraftKey, title, description, questions]);
+
+  const restoreLateDraft = (draft: Draft) => {
+    setTitle(draft.title);
+    setDescription(draft.description);
+    setQuestions(draft.questions);
+    setSelectedKey(draft.questions[0]?.key ?? null);
+    setDraftRestored(true);
+    setLateDraft(null);
+  };
 
   // --- Mutations ---------------------------------------------------------------------------------
 
@@ -334,6 +361,8 @@ export function QuizEditorPage() {
       setError({ message: t('editor.fixQuestions'), questionKey: invalid.key });
       return null;
     }
+    // Saving with the late draft notice on screen is the admin's pick; one offered mid-save is not.
+    const offeredAtStart = lateDraft;
     setSaving(true);
     try {
       let currentId = quizId;
@@ -345,7 +374,8 @@ export function QuizEditorPage() {
           z.object({ quiz: z.object({ id: z.string() }) }),
         );
         currentId = res.quiz.id;
-        clearDraft(draftKey(null));
+        // Owner unknown: the stored draft was never offered, so it is not deleted unseen.
+        if (draftOwner) clearDraft(draftKey(null));
         createdRef.current = currentId;
         setQuizId(currentId);
         navigate(`/admin/quizzes/${currentId}`, { replace: true });
@@ -389,7 +419,8 @@ export function QuizEditorPage() {
         questions: JSON.stringify(savedQuestions.map(toServerQuestion)),
       });
       setDraftRestored(false);
-      clearDraft(draftKey(currentId));
+      setLateDraft((offered) => (offered === offeredAtStart ? null : offered));
+      if (draftOwner) clearDraft(draftKey(currentId));
       if (description.trim()) setDescriptionCollapsed(true);
       return currentId;
     } catch (e) {
@@ -497,7 +528,7 @@ export function QuizEditorPage() {
         onLaunch={() => void launch()}
       />
 
-      {(error || isLocked || draftRestored) && (
+      {(error || isLocked || draftRestored || lateDraft) && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
           {isLocked && (
             <Notice
@@ -523,6 +554,24 @@ export function QuizEditorPage() {
               }
             >
               {t('editor.draftNotice')}
+            </Notice>
+          )}
+          {lateDraft && (
+            <Notice
+              tone="neutral"
+              icon="history"
+              action={
+                <div style={{ display: 'flex', gap: 'var(--space-2)', flexWrap: 'wrap' }}>
+                  <Button variant="secondary" size="sm" onClick={() => restoreLateDraft(lateDraft)}>
+                    {t('editor.lateDraftRestore')}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => setLateDraft(null)}>
+                    {t('editor.lateDraftKeep')}
+                  </Button>
+                </div>
+              }
+            >
+              {t('editor.lateDraftNotice')}
             </Notice>
           )}
           {error && <ErrorAlert>{error.message}</ErrorAlert>}

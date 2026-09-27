@@ -356,6 +356,35 @@ export function readDraft(key: string, adminId: string): Draft | null {
   }
 }
 
+/**
+ * Draft to offer when the author is only confirmed after the editor opened (`/auth/me` failed at
+ * load, a later retry succeeded). The load path never offered what is stored, and the screen has
+ * been edited since: a stored draft of that admin that differs from the screen must be offered, not
+ * silently overwritten by the first autosave. `stored` comes from `readDraft`, so it is always the
+ * confirmed admin's own. Same rules as the load path: an empty draft (no title, no question) and
+ * one equal to the saved version (`saved`, trimmed, questions as `toServerQuestion` JSON) are not
+ * offered; nor is a malformed one (older shape) — the next autosave replaces it.
+ */
+export function lateDraftToOffer(
+  stored: Draft | null,
+  onScreen: { title: string; description: string; questions: EditorQuestion[] },
+  saved: { title: string; description: string; questions: string },
+): Draft | null {
+  if (!stored || (!stored.title && stored.questions.length === 0)) return null;
+  try {
+    if (
+      stored.title.trim() === saved.title &&
+      stored.description.trim() === saved.description &&
+      JSON.stringify(stored.questions.map(toServerQuestion)) === saved.questions
+    ) {
+      return null;
+    }
+    return serialize(stored) === serialize(onScreen) ? null : stored;
+  } catch {
+    return null;
+  }
+}
+
 export function writeDraft(key: string, adminId: string, draft: Omit<Draft, 'at' | 'author'>): void {
   try {
     localStorage.setItem(key, JSON.stringify({ ...draft, at: Date.now(), author: adminId }));
