@@ -65,6 +65,16 @@ export const ADMIN_PASSWORD_MAX_LENGTH = 256;
 export const LOGIN_ATTEMPTS_PER_MINUTE = 10;
 export const CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE = 5;
 /**
+ * HS256 signing secret of the admin JWTs (`JWT_SECRET`, checked by apps/api/src/config.ts). Length
+ * alone does not make a secret: on top of the minimum length, a secret with fewer than
+ * JWT_SECRET_MIN_DISTINCT_CHARS distinct characters, or made of one unit repeated at least twice
+ * (`abcabcabc…`, `passwordpassword…`), is refused. Deterministic and cheap, it only catches the
+ * obviously hand-typed ones: a 32-character hex secret has ~14 distinct characters on average (the
+ * odds of fewer than 8 are about 4e-8), `openssl rand -base64 48` output has ~40.
+ */
+export const JWT_SECRET_MIN_LENGTH = 32;
+export const JWT_SECRET_MIN_DISTINCT_CHARS = 8;
+/**
  * Per-account login budget, on top of the per-address one: past LOGIN_FAILURES_PER_ACCOUNT failed
  * attempts on one email within LOGIN_FAILURE_WINDOW_MS (counted from the first), every further attempt
  * on that email is refused RATE_LIMITED without hashing anything until the window ends — whatever the

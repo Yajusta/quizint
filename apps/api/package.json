@@ -5,14 +5,14 @@
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "scripts": {
-    "dev": "tsx watch --env-file-if-exists=.env src/server.ts",
+    "dev": "tsx watch --env-file-if-exists=.env --import ./scripts/dev-env.mjs src/server.ts",
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "pretest": "node scripts/reset-test-db.mjs",
     "test": "vitest run",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:seed": "tsx prisma/seed.ts",
+    "db:seed": "tsx --env-file-if-exists=.env --import ./scripts/dev-env.mjs prisma/seed.ts",
     "db:push": "prisma db push",
     "prisma:generate": "prisma generate",
     "check:scores": "tsx scripts/check-scores.ts"

@@ -8,7 +8,7 @@ import fp from 'fastify-plugin';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { randomBytes } from 'node:crypto';
 
-import { getConfig } from '../config.js';
+import { getConfig, isDevOrTestEnv } from '../config.js';
 import {
   ACCESS_TOKEN_COOKIE,
   REFRESH_TOKEN_COOKIE,
@@ -95,7 +95,8 @@ function cookieOpts(maxAge: number) {
     path: '/',
     httpOnly: true,
     sameSite: 'lax' as const,
-    secure: process.env.NODE_ENV === 'production',
+    // Fail closed: only an explicit development/test NODE_ENV drops `secure` (plain-http Vite dev).
+    secure: !isDevOrTestEnv(getConfig().NODE_ENV),
     maxAge,
   };
 }

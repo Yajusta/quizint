@@ -21,6 +21,7 @@ import {
   errorMessage,
 } from '@quiz/shared';
 
+import { isDevOrTestEnv } from '../config.js';
 import { ACCESS_TOKEN_COOKIE } from '../lib/api.js';
 import { SessionManager, presenterRoom } from '../modules/live/SessionManager.js';
 import {
@@ -57,7 +58,7 @@ function socketIp(socket: Socket): string {
 
 export const livePlugin = fp(
   async (app: FastifyInstance) => {
-    const origins = allowedOrigins(app.config.PUBLIC_URL, app.config.NODE_ENV === 'production');
+    const origins = allowedOrigins(app.config.PUBLIC_URL, !isDevOrTestEnv(app.config.NODE_ENV));
     const io = new SocketIOServer(app.server, {
       path: '/socket.io',
       maxHttpBufferSize: 8 * 1024,

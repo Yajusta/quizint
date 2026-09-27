@@ -2,7 +2,7 @@
 
 import { PrismaClient } from '@prisma/client';
 
-import { PLACEHOLDER_PASSWORDS } from '../src/config.js';
+import { isDevOrTestEnv, PLACEHOLDER_PASSWORDS } from '../src/config.js';
 import { hashPassword } from '../src/lib/password.js';
 
 const prisma = new PrismaClient();
@@ -16,7 +16,8 @@ async function main(): Promise<void> {
     console.log('SEED_ADMIN_EMAIL / SEED_ADMIN_PASSWORD not set — skipping seed.');
     return;
   }
-  if (process.env.NODE_ENV === 'production' && PLACEHOLDER_PASSWORDS.has(password)) {
+  // Fail closed like config.ts: an unset NODE_ENV counts as production.
+  if (!isDevOrTestEnv(process.env.NODE_ENV) && PLACEHOLDER_PASSWORDS.has(password)) {
     console.error('SEED_ADMIN_PASSWORD is the template placeholder — refusing to seed a public password.');
     process.exitCode = 1;
     return;

@@ -7,7 +7,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import rateLimit from '@fastify/rate-limit';
 import helmet from '@fastify/helmet';
 
-import { getConfig, usesDevJwtSecret } from './config.js';
+import { devJwtSecretWarning, getConfig, isDevOrTestEnv } from './config.js';
 import { apiError } from './lib/api.js';
 import { trustCaddyHop } from './lib/proxy.js';
 import { RateLimitedError, rateLimitErrorResponse, rateLimitKeyGenerator } from './lib/rate-limit.js';
@@ -36,12 +36,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
-  if (config.NODE_ENV !== 'test' && usesDevJwtSecret(config)) {
-    app.log.warn(
-      'JWT_SECRET is the public development secret committed in .env.example: anyone can forge admin ' +
-        'tokens for this server. Set a random JWT_SECRET of at least 32 bytes before exposing it.',
-    );
-  }
+  const secretWarning = devJwtSecretWarning(config);
+  if (secretWarning) app.log.warn(secretWarning);
 
   // Set before any plugin is registered so every encapsulated context inherits it. A rate-limit
   // refusal (thrown by @fastify/rate-limit through rateLimitErrorResponse, its Retry-After header
@@ -69,7 +65,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(livePlugin);
 
   await app.register(async (api) => {
-    api.addHook('onRequest', csrfGuard(config.PUBLIC_URL, config.NODE_ENV === 'production'));
+    api.addHook('onRequest', csrfGuard(config.PUBLIC_URL, !isDevOrTestEnv(config.NODE_ENV)));
     // Keyed per client address, an IPv6 client per /64 (rateLimitKeyGenerator); every per-route
     // limit inherits the key and the RATE_LIMITED envelope unless it sets its own.
     await api.register(rateLimit, {
