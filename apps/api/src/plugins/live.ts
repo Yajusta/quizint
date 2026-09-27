@@ -23,7 +23,12 @@ import {
 
 import { ACCESS_TOKEN_COOKIE } from '../lib/api.js';
 import { SessionManager, presenterRoom } from '../modules/live/SessionManager.js';
-import { ConcurrencyCap, SocketLimiter, clientIp, isAllowedOrigin } from '../modules/live/socket-guards.js';
+import {
+  ConcurrencyCap,
+  SocketLimiter,
+  clientRateLimitKey,
+  isAllowedOrigin,
+} from '../modules/live/socket-guards.js';
 import { allowedOrigins } from './csrf.js';
 
 /** socket.io middleware refusal carrying a machine-readable code in `err.data`. */
@@ -42,9 +47,12 @@ const ipJoinLimiter = new SocketLimiter(60, 10_000);
 // Open /participant sockets per client IP: the rates above slow a flood down, this bounds it.
 const ipParticipantSockets = new ConcurrencyCap(MAX_PARTICIPANT_SOCKETS_PER_IP);
 
-/** Client IP as Caddy forwards it: see clientIp (the same one-hop rule as REST). */
+/**
+ * Per-IP bucket key of a socket: the client IP as Caddy forwards it (clientIp, the same one-hop rule
+ * as REST), an IPv6 client counted per /64 (the same rateLimitKey as REST).
+ */
 function socketIp(socket: Socket): string {
-  return clientIp(socket.handshake.headers, socket.handshake.address);
+  return clientRateLimitKey(socket.handshake.headers, socket.handshake.address);
 }
 
 export const livePlugin = fp(

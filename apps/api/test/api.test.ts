@@ -13,6 +13,8 @@ import {
   CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE,
   ENDED_PURGE_DELAY_MS,
   IMAGE_MAX_INPUT_PIXELS,
+  LOGIN_ATTEMPTS_PER_MINUTE,
+  LOGIN_FAILURES_PER_ACCOUNT,
   MAX_JOINS_PER_SECOND_PER_SESSION,
   SESSION_IDLE_TIMEOUT_MS,
 } from '@quiz/shared';
@@ -2381,6 +2383,92 @@ describe('live engine', () => {
       expect(logout.statusCode).toBe(204);
       expect(await handshake('/presenter', { auth: { sessionId }, cookie: session })).toBe('UNAUTHORIZED');
     });
+  });
+});
+
+describe('login throttling', () => {
+  // Clients behind Caddy (a private peer) so X-Forwarded-For names them: IPv6 documentation-range
+  // addresses, one /64 per `net` value. Dedicated emails, so no other test's budget moves.
+  const caddy = '172.18.0.9';
+  const from = (net: number, host = 1) => ({
+    remoteAddress: caddy,
+    xff: `2001:db8:${net.toString(16)}:0:${host.toString(16)}::1`,
+  });
+  let nextNet = 0x100;
+  const freshNet = () => nextNet++;
+  const password = 'throttle-pass-12';
+  const emails = ['throttle-target@example.fr', 'throttle-bystander@example.fr', 'throttle-reset@example.fr'];
+  const login = (at: { remoteAddress: string; xff: string }, email: string, pass: string) =>
+    app.inject({
+      method: 'POST',
+      url: '/api/v1/auth/login',
+      remoteAddress: at.remoteAddress,
+      headers: { 'x-forwarded-for': at.xff },
+      payload: { email, password: pass },
+    });
+  const expectRateLimited = (res: Awaited<ReturnType<typeof login>>) => {
+    expect(res.statusCode).toBe(429);
+    expect(res.json()).toEqual({
+      error: { code: 'RATE_LIMITED', message: 'Trop de requêtes, réessayez dans un instant' },
+    });
+    expect(Number(res.headers['retry-after'])).toBeGreaterThan(0);
+  };
+
+  beforeAll(async () => {
+    const passwordHash = await hash(password);
+    for (const email of emails) {
+      await app.prisma.admin.create({ data: { email, displayName: 'Throttle', passwordHash } });
+    }
+  });
+
+  afterAll(async () => {
+    await app.prisma.admin.deleteMany({ where: { email: { in: emails } } });
+  });
+
+  it('addresses of one IPv6 /64 share the per-address login budget, with the RATE_LIMITED envelope', async () => {
+    const net = freshNet();
+    // Distinct unknown emails: only the per-address budget is spent here.
+    for (let i = 0; i < LOGIN_ATTEMPTS_PER_MINUTE; i++) {
+      const res = await login(from(net, (i % 3) + 1), `slash64-${i}@example.fr`, 'wrong-password-1');
+      expect(res.statusCode).toBe(401);
+    }
+    expectRateLimited(await login(from(net, 0xbeef), 'slash64-last@example.fr', 'wrong-password-1'));
+    // Another /64 has a budget of its own.
+    const other = await login(from(freshNet()), 'slash64-other@example.fr', 'wrong-password-1');
+    expect(other.statusCode).toBe(401);
+  });
+
+  it('an account refuses any attempt once its failures are spent, from any address', async () => {
+    const [target, bystander] = [emails[0]!, emails[1]!];
+    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) {
+      const res = await login(from(freshNet()), target, `wrong-guess-${i}-pad`);
+      expect(res.statusCode).toBe(401);
+      expect(res.json().error.code).toBe('INVALID_CREDENTIALS');
+    }
+    // Even the right password, from a fresh address, in any letter case: not checked at all.
+    expectRateLimited(await login(from(freshNet()), target, password));
+    expectRateLimited(await login(from(freshNet()), target.toUpperCase(), password));
+    // Another account is unaffected.
+    expect((await login(from(freshNet()), bystander, password)).statusCode).toBe(200);
+  });
+
+  it('an unknown email is counted exactly like a known one', async () => {
+    const ghost = 'throttle-ghost@example.fr';
+    for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT; i++) {
+      expect((await login(from(freshNet()), ghost, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
+    }
+    expectRateLimited(await login(from(freshNet()), ghost, 'wrong-guess-last'));
+  });
+
+  it('a successful login clears the account failures', async () => {
+    const email = emails[2]!;
+    for (let round = 0; round < 2; round++) {
+      for (let i = 0; i < LOGIN_FAILURES_PER_ACCOUNT - 1; i++) {
+        expect((await login(from(freshNet()), email, `wrong-guess-${i}-pad`)).statusCode).toBe(401);
+      }
+      // 9 + 1 + 9 attempts in all: without the reset, the second round would end in 429s.
+      expect((await login(from(freshNet()), email, password)).statusCode).toBe(200);
+    }
   });
 });
 

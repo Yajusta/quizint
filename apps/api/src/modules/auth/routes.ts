@@ -19,6 +19,7 @@ import {
   validationError,
 } from '../../lib/api.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
+import { LoginFailureTracker } from '../../lib/rate-limit.js';
 
 function toAdminDTO(a: {
   id: string;
@@ -41,22 +42,44 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   // time and yields the same 401 as a wrong password (no user enumeration). A hand-written
   // hash string would make argon2 throw and turn the unknown-email branch into a 500.
   const dummyHash = await hashPassword(`dummy-${Date.now()}`);
+  // Per-account budget (LOGIN_FAILURES_PER_ACCOUNT per LOGIN_FAILURE_WINDOW_MS), one per app instance.
+  const loginFailures = new LoginFailureTracker();
 
   // --- POST /api/v1/auth/login ---------------------------------------------
+  // Two budgets: per client address (the route limit, an IPv6 client per /64) and per account
+  // (loginFailures), so rotating through many addresses buys no more guesses on one account.
   app.post(
     '/auth/login',
     { config: { rateLimit: { max: LOGIN_ATTEMPTS_PER_MINUTE, timeWindow: '1 minute' } } },
     async (req, reply) => {
       const parsed = LoginInput.safeParse(req.body);
       if (!parsed.success) return reply.status(400).send(apiError('INVALID_CREDENTIALS'));
-      const { email, password } = parsed.data;
+      const { password } = parsed.data;
+      const email = parsed.data.email.toLowerCase();
 
-      const admin = await app.prisma.admin.findUnique({ where: { email: email.toLowerCase() } });
-      // Constant-ish time: verify against the dummy hash when the admin is unknown.
-      const ok = await verifyPassword(admin?.passwordHash ?? dummyHash, password);
+      // Spent budget: refused before any lookup or hashing, the same way for a known and an unknown
+      // email (both are counted alike below), so the 429 reveals nothing about the account.
+      const retryAfter = loginFailures.throttledFor(email);
+      if (retryAfter !== null) {
+        return reply.status(429).header('retry-after', retryAfter).send(apiError('RATE_LIMITED'));
+      }
+      // Counted up front, cleared on success: parallel attempts cannot all pass the check above
+      // while their hashes run.
+      loginFailures.countFailure(email);
+
+      const { admin, ok } = await (async () => {
+        const found = await app.prisma.admin.findUnique({ where: { email } });
+        // Constant-ish time: verify against the dummy hash when the admin is unknown.
+        return { admin: found, ok: await verifyPassword(found?.passwordHash ?? dummyHash, password) };
+      })().catch((err: unknown) => {
+        // A server fault (answered 500) is no wrong guess: give the attempt back.
+        loginFailures.uncountFailure(email);
+        throw err;
+      });
       if (!admin || !ok || !admin.isActive) {
         return reply.status(401).send(apiError('INVALID_CREDENTIALS'));
       }
+      loginFailures.reset(email);
 
       app.issueAccessToken(reply, admin);
       await app.issueRefreshToken(reply, admin.id, admin.passwordChangedAt);

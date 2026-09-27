@@ -3,6 +3,8 @@
 
 import type { IncomingHttpHeaders } from 'node:http';
 
+import { rateLimitKey } from '@quiz/shared';
+
 import { trustCaddyHop } from '../../lib/proxy.js';
 
 /** Simple token bucket keyed by socket id or client IP (§6.7). */
@@ -71,6 +73,15 @@ export function clientIp(headers: IncomingHttpHeaders, address: string): string 
   const forwarded = headers['x-forwarded-for'];
   const last = (Array.isArray(forwarded) ? forwarded.at(-1) : forwarded)?.split(',').at(-1)?.trim();
   return last || address;
+}
+
+/**
+ * The key every per-IP socket guard counts a client under: `clientIp` bucketed like REST's
+ * (`rateLimitKey`: IPv4 as is, an IPv6 client per /64), so rotating addresses inside one /64 does
+ * not open fresh handshake, join or open-socket budgets.
+ */
+export function clientRateLimitKey(headers: IncomingHttpHeaders, address: string): string {
+  return rateLimitKey(clientIp(headers, address));
 }
 
 /**

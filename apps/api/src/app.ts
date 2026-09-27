@@ -10,6 +10,7 @@ import helmet from '@fastify/helmet';
 import { getConfig, usesDevJwtSecret } from './config.js';
 import { apiError } from './lib/api.js';
 import { trustCaddyHop } from './lib/proxy.js';
+import { RateLimitedError, rateLimitErrorResponse, rateLimitKeyGenerator } from './lib/rate-limit.js';
 import { authPlugin } from './plugins/auth.js';
 import { csrfGuard } from './plugins/csrf.js';
 import { prismaPlugin } from './plugins/prisma.js';
@@ -42,11 +43,14 @@ export async function buildApp(): Promise<FastifyInstance> {
     );
   }
 
-  // Set before any plugin is registered so every encapsulated context inherits it. A 4xx keeps
-  // Fastify's own answer (rethrown to the default handler: rate limit 429, multipart 413, bad JSON
-  // 400…); a 5xx is logged and answered with the generic INTERNAL envelope, never the raw message
-  // (a Prisma error text names tables, columns and constraints).
+  // Set before any plugin is registered so every encapsulated context inherits it. A rate-limit
+  // refusal (thrown by @fastify/rate-limit through rateLimitErrorResponse, its Retry-After header
+  // already set) gets the standard RATE_LIMITED envelope. Any other 4xx keeps Fastify's own answer
+  // (rethrown to the default handler: multipart 413, bad JSON 400…); a 5xx is logged and answered
+  // with the generic INTERNAL envelope, never the raw message (a Prisma error text names tables,
+  // columns and constraints).
   app.setErrorHandler((error: FastifyError, req, reply) => {
+    if (error instanceof RateLimitedError) return reply.status(429).send(apiError('RATE_LIMITED'));
     const status = error.statusCode ?? 500;
     if (status < 500) throw error;
     req.log.error({ err: error }, 'request failed');
@@ -66,10 +70,14 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   await app.register(async (api) => {
     api.addHook('onRequest', csrfGuard(config.PUBLIC_URL, config.NODE_ENV === 'production'));
+    // Keyed per client address, an IPv6 client per /64 (rateLimitKeyGenerator); every per-route
+    // limit inherits the key and the RATE_LIMITED envelope unless it sets its own.
     await api.register(rateLimit, {
       global: true,
       max: 2000,
       timeWindow: '1 minute',
+      keyGenerator: rateLimitKeyGenerator,
+      errorResponseBuilder: rateLimitErrorResponse,
     });
     await api.register(authRoutes, { prefix: '/api/v1' });
     await api.register(quizRoutes, { prefix: '/api/v1' });

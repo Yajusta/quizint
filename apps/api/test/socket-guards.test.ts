@@ -2,7 +2,12 @@
 
 import { describe, expect, it } from 'vitest';
 
-import { ConcurrencyCap, clientIp, isAllowedOrigin } from '../src/modules/live/socket-guards.js';
+import {
+  ConcurrencyCap,
+  clientIp,
+  clientRateLimitKey,
+  isAllowedOrigin,
+} from '../src/modules/live/socket-guards.js';
 import { allowedOrigins } from '../src/plugins/csrf.js';
 
 describe('clientIp', () => {
@@ -21,6 +26,18 @@ describe('clientIp', () => {
 
   it('ignores the header from a public peer (a directly exposed port), like trustProxy', () => {
     expect(clientIp({ 'x-forwarded-for': '203.0.113.7' }, '198.51.100.4')).toBe('198.51.100.4');
+  });
+});
+
+describe('clientRateLimitKey', () => {
+  it('buckets an IPv6 client per /64 and an IPv4 one per address, behind Caddy or not', () => {
+    const behindCaddy = (xff: string) => clientRateLimitKey({ 'x-forwarded-for': xff }, '10.0.0.2');
+    expect(behindCaddy('2001:db8:1:2::1')).toBe('2001:db8:1:2::/64');
+    expect(behindCaddy('2001:db8:1:2:dead:beef::9')).toBe('2001:db8:1:2::/64');
+    expect(behindCaddy('2001:db8:1:3::1')).toBe('2001:db8:1:3::/64');
+    expect(behindCaddy('203.0.113.7')).toBe('203.0.113.7');
+    expect(clientRateLimitKey({}, '2001:db8:9:9::5')).toBe('2001:db8:9:9::/64');
+    expect(clientRateLimitKey({}, '::ffff:203.0.113.7')).toBe('203.0.113.7');
   });
 });
 

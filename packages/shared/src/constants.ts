@@ -58,11 +58,32 @@ export const ADMIN_PASSWORD_MIN_LENGTH = 12;
 // Upper bound on every password field (login included): Argon2 hashes whatever it is given, so an
 // unbounded body would let one request burn CPU and memory on a multi-megabyte "password".
 export const ADMIN_PASSWORD_MAX_LENGTH = 256;
-// Password-guessing budgets per minute. Login is keyed on the client IP; change-password on the
+// Password-guessing budgets per minute. Login is keyed on the client address (see
+// RATE_LIMIT_IPV6_PREFIX_LENGTH) and also counted per account below; change-password on the
 // admin of a verified access JWT, so a stolen session cookie cannot brute-force the current password
 // (and turn a temporary theft into a takeover) by rotating IPs.
 export const LOGIN_ATTEMPTS_PER_MINUTE = 10;
 export const CHANGE_PASSWORD_ATTEMPTS_PER_MINUTE = 5;
+/**
+ * Per-account login budget, on top of the per-address one: past LOGIN_FAILURES_PER_ACCOUNT failed
+ * attempts on one email within LOGIN_FAILURE_WINDOW_MS (counted from the first), every further attempt
+ * on that email is refused RATE_LIMITED without hashing anything until the window ends — whatever the
+ * address it comes from. Unknown emails are counted exactly like known ones (no enumeration).
+ */
+export const LOGIN_FAILURES_PER_ACCOUNT = 10;
+export const LOGIN_FAILURE_WINDOW_MS = 15 * 60 * 1000;
+/**
+ * Emails the per-account counter tracks at once: past it, the oldest entry is evicted, so a flood of
+ * made-up emails costs bounded memory (a key is a fixed-size hash, ~100 bytes a slot).
+ */
+export const LOGIN_FAILURE_TRACKED_ACCOUNTS_MAX = 20_000;
+
+/**
+ * Per-address limits (REST rate limits, socket handshake and join buckets, socket caps) key an IPv6
+ * client on this prefix, not on its full address: one subscriber is routinely handed a whole /64, so
+ * a per-address bucket would let it rotate through 2^64 fresh ones. IPv4 stays per address.
+ */
+export const RATE_LIMIT_IPV6_PREFIX_LENGTH = 64;
 
 export const UPLOAD_MAX_IMAGE_MB = 8;
 export const UPLOAD_MAX_AUDIO_MB = 15;
