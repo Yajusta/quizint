@@ -11,6 +11,7 @@ export default {
     myQuizzes: 'Mes quiz',
     sessions: 'Sessions',
     accounts: 'Comptes',
+    myAccount: 'Mon compte',
     logout: 'Se déconnecter',
   },
 
@@ -145,7 +146,8 @@ export default {
   },
 
   accounts: {
-    title: 'Comptes admin',
+    title: 'Comptes',
+    titleOwn: 'Mon compte',
     listLabel: 'Comptes',
     settingsLabel: 'Réglages du compte',
     disabled: 'Désactivé',
@@ -169,6 +171,36 @@ export default {
     passwordUpdated: 'Mot de passe mis à jour',
     disableTitle: `Désactiver ce compte${NBSP}?`,
     disableDescription: '{{name}} ne pourra plus se connecter. Ses quiz et ses sessions sont conservés.',
+    you: 'Vous',
+    role: {
+      ADMIN: 'Administrateur',
+      USER: 'Utilisateur',
+    },
+    roleLabel: 'Rôle',
+    roleHint: 'Un administrateur gère aussi les comptes.',
+    makeAdmin: 'Passer administrateur',
+    makeUser: 'Passer utilisateur',
+    promoteTitle: `Donner le rôle administrateur${NBSP}?`,
+    promoteDescription: '{{name}} pourra créer, modifier et désactiver tous les comptes.',
+    demoteTitle: `Retirer le rôle administrateur${NBSP}?`,
+    demoteDescription: '{{name}} garde ses quiz et ses sessions, mais ne gère plus les comptes.',
+    roleUpdated: `Rôle mis à jour${NBSP}: {{name}}`,
+    resetPassword: 'Réinitialiser le mot de passe',
+    resetTitle: 'Réinitialiser le mot de passe',
+    resetDescription:
+      '{{name}} sera déconnecté partout et devra se connecter avec ce nouveau mot de passe. Transmettez-le par un canal sûr.',
+    resetConfirm: 'Réinitialiser',
+    passwordReset: `Mot de passe réinitialisé${NBSP}: {{name}}`,
+    apiErrors: {
+      FORBIDDEN:
+        'Votre compte n’a plus le rôle administrateur. Seul votre mot de passe reste modifiable ici.',
+      LAST_ADMIN: 'Il doit rester au moins un administrateur actif.',
+      CANNOT_DEACTIVATE_SELF: 'Vous ne pouvez pas désactiver votre propre compte.',
+      CANNOT_RESET_OWN_PASSWORD: `Pour votre propre compte, utilisez «${NBSP}Changer mon mot de passe${NBSP}».`,
+      RATE_LIMITED: 'Trop de tentatives. Réessayez dans un instant.',
+      INVALID_CREDENTIALS: 'Mot de passe actuel incorrect.',
+      NOT_FOUND: 'Ce compte n’existe plus. Rechargez la page.',
+    },
   },
 
   questionTypeShort: {

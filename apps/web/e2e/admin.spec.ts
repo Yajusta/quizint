@@ -203,30 +203,34 @@ async function createQuiz(
   return quiz.id;
 }
 
+/** Password of the demo accounts created by `ensureAdmin`. */
+const DEMO_PASSWORD = 'demo-password-12';
+
 /**
  * Admin accounts cannot be deleted (deactivation only): this function is therefore
- * idempotent — creation if absent, then `isActive` aligned on the wanted state.
+ * idempotent — creation if absent, then `role` and `isActive` aligned on the wanted state (the
+ * roles migration promoted every account that already existed to ADMIN). The password is only set
+ * at creation: a reset from the UI would break the USER login of the next run.
  */
 async function ensureAdmin(
   request: APIRequestContext,
-  spec: { email: string; displayName: string; isActive: boolean },
+  spec: { email: string; displayName: string; role: 'ADMIN' | 'USER'; isActive: boolean },
 ): Promise<void> {
   const before = await api<{ admins: Array<{ id: string; email: string }> }>(request, 'GET', '/admins');
   if (!before.admins.some((a) => a.email === spec.email)) {
     await api(request, 'POST', '/admins', {
       email: spec.email,
       displayName: spec.displayName,
-      password: 'demo-password-12',
+      password: DEMO_PASSWORD,
+      role: spec.role,
     });
   }
-  const after = await api<{ admins: Array<{ id: string; email: string; isActive: boolean }> }>(
-    request,
-    'GET',
-    '/admins',
-  );
+  const after = await api<{
+    admins: Array<{ id: string; email: string; role: string; isActive: boolean }>;
+  }>(request, 'GET', '/admins');
   const admin = after.admins.find((a) => a.email === spec.email);
-  if (admin && admin.isActive !== spec.isActive) {
-    await api(request, 'PATCH', `/admins/${admin.id}`, { isActive: spec.isActive });
+  if (admin && (admin.isActive !== spec.isActive || admin.role !== spec.role)) {
+    await api(request, 'PATCH', `/admins/${admin.id}`, { isActive: spec.isActive, role: spec.role });
   }
 }
 
@@ -396,15 +400,18 @@ test.describe('Back-office — protocole visuel du lot 3', () => {
     liveCodes = [geo.code, culture.code];
     expect(liveCodes).toHaveLength(2);
 
-    // One active account and one deactivated: « Comptes » must show the `Badge danger`.
+    // One active USER and one deactivated: « Comptes » must show both role badges and the
+    // `Badge danger`; Claire also signs in below to capture the USER view.
     await ensureAdmin(page.request, {
       email: 'claire.dupont@example.fr',
       displayName: 'Claire Dupont',
+      role: 'USER',
       isActive: true,
     });
     await ensureAdmin(page.request, {
       email: 'marc.olivier@example.fr',
       displayName: 'Marc Olivier',
+      role: 'USER',
       isActive: false,
     });
   });
@@ -434,7 +441,9 @@ test.describe('Back-office — protocole visuel du lot 3', () => {
 
   test('comptes — liste et dialog de désactivation', async () => {
     await gotoAdmin(page, '/admin/admins');
+    await expect(page.getByRole('tab', { name: 'Comptes' })).toBeVisible();
     await expect(page.getByText('Créer un compte')).toBeVisible();
+    await expect(page.getByLabel('Rôle')).toHaveValue('USER');
     await capture(page, 'comptes', 'admin-1440');
 
     await page.getByRole('button', { name: 'Désactiver' }).first().click();
@@ -443,5 +452,49 @@ test.describe('Back-office — protocole visuel du lot 3', () => {
     await page.getByRole('button', { name: 'Annuler' }).click();
 
     expect(errors, 'erreurs console pendant le parcours admin').toEqual([]);
+  });
+
+  test('comptes — dialogs de rôle et de réinitialisation', async () => {
+    const claire = page.getByRole('region', { name: 'Comptes' }).locator('div', {
+      hasText: 'claire.dupont@example.fr',
+    });
+
+    await claire.getByRole('button', { name: 'Passer administrateur' }).last().click();
+    await expect(page.getByRole('dialog')).toContainText('Claire Dupont');
+    await capture(page, 'comptes-dialog-role', 'admin-1440');
+    await page.getByRole('button', { name: 'Annuler' }).click();
+
+    // A too-short password is refused client-side, inside the dialog: nothing reaches the API.
+    await claire.getByRole('button', { name: 'Réinitialiser le mot de passe' }).last().click();
+    const dialog = page.getByRole('dialog');
+    await dialog.getByLabel('Nouveau mot de passe').fill('court');
+    await dialog.getByRole('button', { name: 'Réinitialiser', exact: true }).click();
+    await expect(dialog.getByRole('alert')).toBeVisible();
+    await capture(page, 'comptes-dialog-reinitialisation', 'admin-1440');
+    await dialog.getByRole('button', { name: 'Annuler' }).click();
+
+    expect(errors, 'erreurs console pendant le parcours admin').toEqual([]);
+  });
+
+  test('mon compte — vue utilisateur', async ({ browser }) => {
+    const userContext = await browser.newContext({ viewport: VIEWPORTS['admin-1440'] });
+    const userPage = await userContext.newPage();
+    const userErrors = watchForErrors(userPage);
+    await userPage.goto('/admin/login', { waitUntil: 'networkidle' });
+    await userPage.getByLabel('Adresse e-mail').fill('claire.dupont@example.fr');
+    await userPage.getByLabel('Mot de passe').fill(DEMO_PASSWORD);
+    await userPage.getByRole('button', { name: 'Se connecter' }).click();
+    await expect(userPage).toHaveURL(/\/admin$/);
+
+    await gotoAdmin(userPage, '/admin/admins');
+    // Own password only: no account list, no creation form, and never a GET /admins (403).
+    await expect(userPage.getByRole('tab', { name: 'Mon compte' })).toBeVisible();
+    await expect(userPage.getByRole('heading', { name: 'Mon compte', level: 1 })).toBeVisible();
+    await expect(userPage.getByText('Changer mon mot de passe')).toBeVisible();
+    await expect(userPage.getByText('Créer un compte')).toHaveCount(0);
+    await capture(userPage, 'mon-compte-utilisateur', 'admin-1440');
+
+    expect(userErrors, 'erreurs console pendant le parcours utilisateur').toEqual([]);
+    await userContext.close();
   });
 });

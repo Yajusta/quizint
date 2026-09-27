@@ -2,15 +2,21 @@
 //
 // Extracted from `AdminLayout` in lot 5: `LoginPage` only needed `resetMe`, but importing it
 // from the layout module pulled the whole admin shell (and its components) into the
-// `/admin/login` chunk. This module depends only on the REST client.
+// `/admin/login` chunk. This module depends only on React and the REST client.
+
+import { useEffect, useState } from 'react';
 
 import { z } from 'zod';
 
+import { AccountRole } from '@quiz/shared';
+
 import { apiJson, ApiErrorThrown } from './api-client.ts';
 
-const MeSchema = z.object({ admin: z.object({ id: z.string(), displayName: z.string() }) });
+const MeSchema = z.object({
+  admin: z.object({ id: z.string(), displayName: z.string(), role: AccountRole }),
+});
 
-type Me = z.infer<typeof MeSchema>['admin'];
+export type Me = z.infer<typeof MeSchema>['admin'];
 
 /**
  * Identity of the current admin as the server confirms it (`/auth/me`), resolved **once per
@@ -19,6 +25,8 @@ type Me = z.infer<typeof MeSchema>['admin'];
  * Never rejects: `null` means unknown.
  */
 let mePromise: Promise<Me | null> | null = null;
+/** Mounted `useMe` hooks, told when a fresher identity replaces the memo (`primeMe`). */
+const listeners = new Set<(me: Me | null) => void>();
 
 function fetchIdentity(): Promise<Me | null> {
   if (!mePromise) {
@@ -34,20 +42,48 @@ function fetchIdentity(): Promise<Me | null> {
   return mePromise;
 }
 
-/** Display name for the top bar badge; `null` leaves it hidden. */
-export function fetchMe(): Promise<string | null> {
-  return fetchIdentity().then((me) => me?.displayName ?? null);
+/**
+ * Memoised identity for the top bar (name badge, role-dependent navigation): `undefined` while it
+ * loads, `null` when unknown. Purely informative — the server enforces every role on its own, and a
+ * 401 redirect stays each page's business. Re-renders when a page primes a fresher identity.
+ */
+export function useMe(): Me | null | undefined {
+  const [me, setMe] = useState<Me | null | undefined>(undefined);
+  useEffect(() => {
+    let alive = true;
+    const update = (next: Me | null) => {
+      if (alive) setMe(next);
+    };
+    listeners.add(update);
+    void fetchIdentity().then(update);
+    return () => {
+      alive = false;
+      listeners.delete(update);
+    };
+  }, []);
+  return me;
 }
 
 /**
- * Admin id that owns the local editor drafts. Always asked to the server, never read from the
- * memo: the memo is only reset by this tab's own login, logout or 401, so after another admin signs
- * in from a second tab (cookies are shared) it would still name the previous one and hand that
- * admin's drafts to the new one. Rejects like the REST client does, 401 included.
+ * Identity asked to the server, never read from the memo: the memo is only reset by this tab's own
+ * login, logout or 401, so after another admin signs in from a second tab (cookies are shared), or
+ * after a role change, it would still describe the previous state. Rejects like the REST client
+ * does, 401 included.
  */
-export async function fetchMeId(): Promise<string> {
+export async function fetchFreshMe(): Promise<Me> {
   const { admin } = await apiJson.get('/auth/me', MeSchema);
-  return admin.id;
+  return admin;
+}
+
+/** Admin id that owns the local editor drafts (see `fetchFreshMe` for why it skips the memo). */
+export async function fetchMeId(): Promise<string> {
+  return (await fetchFreshMe()).id;
+}
+
+/** Replaces the memo with an identity just read from the server and updates the mounted hooks. */
+export function primeMe(me: Me): void {
+  mePromise = Promise.resolve(me);
+  for (const listener of listeners) listener(me);
 }
 
 /**

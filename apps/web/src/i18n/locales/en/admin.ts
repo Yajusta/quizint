@@ -6,6 +6,7 @@ export default {
     myQuizzes: 'My quizzes',
     sessions: 'Sessions',
     accounts: 'Accounts',
+    myAccount: 'My account',
     logout: 'Sign out',
   },
 
@@ -142,7 +143,8 @@ export default {
   },
 
   accounts: {
-    title: 'Admin accounts',
+    title: 'Accounts',
+    titleOwn: 'My account',
     listLabel: 'Accounts',
     settingsLabel: 'Account settings',
     disabled: 'Disabled',
@@ -166,6 +168,36 @@ export default {
     passwordUpdated: 'Password updated',
     disableTitle: 'Disable this account?',
     disableDescription: '{{name}} will no longer be able to sign in. Their quizzes and sessions are kept.',
+    you: 'You',
+    role: {
+      ADMIN: 'Administrator',
+      USER: 'User',
+    },
+    roleLabel: 'Role',
+    roleHint: 'An administrator also manages the accounts.',
+    makeAdmin: 'Make administrator',
+    makeUser: 'Make user',
+    promoteTitle: 'Grant the administrator role?',
+    promoteDescription: '{{name}} will be able to create, edit and disable every account.',
+    demoteTitle: 'Remove the administrator role?',
+    demoteDescription: '{{name}} keeps their quizzes and sessions, but no longer manages the accounts.',
+    roleUpdated: 'Role updated: {{name}}',
+    resetPassword: 'Reset password',
+    resetTitle: 'Reset the password',
+    resetDescription:
+      '{{name}} will be signed out everywhere and will have to sign in with this new password. Share it through a safe channel.',
+    resetConfirm: 'Reset',
+    passwordReset: 'Password reset: {{name}}',
+    apiErrors: {
+      FORBIDDEN:
+        'Your account no longer has the administrator role. Only your password can still be changed here.',
+      LAST_ADMIN: 'At least one active administrator must remain.',
+      CANNOT_DEACTIVATE_SELF: 'You cannot disable your own account.',
+      CANNOT_RESET_OWN_PASSWORD: 'For your own account, use “Change my password”.',
+      RATE_LIMITED: 'Too many attempts. Try again in a moment.',
+      INVALID_CREDENTIALS: 'Incorrect current password.',
+      NOT_FOUND: 'This account no longer exists. Reload the page.',
+    },
   },
 
   questionTypeShort: {

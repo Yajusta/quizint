@@ -2,13 +2,12 @@
 // derived from `useLocation`, identity + logout on the right. No side rail (deviation § 7-4:
 // three entries do not justify a `SideNav`). The content fits within `--max-content`.
 
-import { useEffect, useState } from 'react';
 import type { CSSProperties, ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Outlet, useLocation, useNavigate } from 'react-router';
 
 import { LanguageSwitcher } from '../../components/LanguageSwitcher.tsx';
-import { fetchMe, resetMe } from '../../lib/admin-identity.ts';
+import { resetMe, useMe } from '../../lib/admin-identity.ts';
 import { Badge, Button, Tabs, Wordmark } from '../../design-system/index.ts';
 import { clearAllDrafts } from './editor/model.ts';
 
@@ -96,19 +95,10 @@ export function AdminLayout({ children }: { children?: ReactNode }) {
   const { t } = useTranslation('admin');
   const navigate = useNavigate();
   const { pathname } = useLocation();
-  const [displayName, setDisplayName] = useState<string | null>(null);
-
-  // Top bar identity (§ 5.3 « admin courant si dispo »). Purely decorative: any error leaves
-  // the badge hidden, the 401 redirect remains each page's business.
-  useEffect(() => {
-    let alive = true;
-    void fetchMe().then((name) => {
-      if (alive) setDisplayName(name);
-    });
-    return () => {
-      alive = false;
-    };
-  }, []);
+  // Top bar identity (§ 5.3 « admin courant si dispo »). Informative only: any error leaves the
+  // badge hidden, the 401 redirect remains each page's business, and the server enforces roles.
+  const me = useMe();
+  const displayName = me?.displayName ?? null;
 
   const logout = async () => {
     await fetch('/api/v1/auth/logout', { method: 'POST', credentials: 'same-origin' }).catch(() => undefined);
@@ -156,7 +146,12 @@ export function AdminLayout({ children }: { children?: ReactNode }) {
             tabs={[
               { value: '/admin', label: t('nav.myQuizzes') },
               { value: '/admin/sessions', label: t('nav.sessions') },
-              { value: '/admin/admins', label: t('nav.accounts') },
+              // Every account reaches this page for its own password; only an ADMIN manages the
+              // others there. Until the role is known the entry reads as the narrower « Mon compte ».
+              {
+                value: '/admin/admins',
+                label: me?.role === 'ADMIN' ? t('nav.accounts') : t('nav.myAccount'),
+              },
             ]}
             value={tabFor(pathname)}
             onChange={(value) => navigate(value)}
