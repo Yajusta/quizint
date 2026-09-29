@@ -129,10 +129,20 @@ export function StageClosed({
         style={{
           display: 'grid',
           gridTemplateColumns: showTop5 ? 'minmax(0, 1fr) 400px' : 'minmax(0, 1fr)',
-          gap: 'var(--space-10)',
+          columnGap: 'var(--space-10)',
+          rowGap: short ? 'var(--space-6)' : 'var(--space-8)',
           alignItems: 'start',
         }}
       >
+        {/* The question spans the stage; the answers and the top 5 share the row below. */}
+        <div style={{ gridColumn: '1 / -1', minWidth: 0 }}>
+          {view ? (
+            <QuestionHead view={view} index={index} total={total} compact />
+          ) : (
+            <ResultHead index={index} total={total} />
+          )}
+        </div>
+
         <div
           style={{
             display: 'flex',
@@ -141,12 +151,6 @@ export function StageClosed({
             minWidth: 0,
           }}
         >
-          {view ? (
-            <QuestionHead view={view} index={index} total={total} compact />
-          ) : (
-            <ResultHead index={index} total={total} />
-          )}
-
           {r.distribution.kind === 'CHOICES' ? (
             <ChoicesReveal result={r} short={short} />
           ) : r.distribution.kind === 'TEXT' ? (
@@ -248,7 +252,7 @@ function ChoicesReveal({ result: r, short }: { result: QuestionResultView; short
       aria-label={t('closed.distributionLabel')}
       style={{
         display: 'grid',
-        gridTemplateColumns: '1fr 1fr',
+        gridTemplateColumns: 'minmax(0, 1fr)',
         gap: short ? 'var(--space-4)' : 'var(--space-5)',
       }}
     >

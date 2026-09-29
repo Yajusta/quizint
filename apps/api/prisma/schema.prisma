@@ -51,9 +51,6 @@ model Quiz {
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
   archivedAt  DateTime? // hidden from the library, restorable; only an archived quiz can be deleted
-  // string[] of question ids that were answered in a session since deleted (RGPD): the answers
-  // cascade away with the session, the lock on those questions must not (423 QUIZ_LOCKED).
-  playedQuestionIds Json?
   questions   Question[]
   sessions    LiveSession[]
 

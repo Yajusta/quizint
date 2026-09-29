@@ -2633,100 +2633,67 @@ describe('live engine', () => {
     expect(res.json().error.details.reason).toBe('correct answer changed');
   });
 
-  it('deleting the played session keeps the quiz locked; duplication stays the escape hatch', async () => {
+  it('the quiz stays locked while a session that answered remains, and unlocks once the last one is deleted', async () => {
     const quiz = await createQuiz('Quiz joué puis purgé', [mcq(), numeric()]);
-    const { sessionId, code, s } = await createLiveSession(quiz.id);
-    const { participant } = await joinAs(code, 'Rgpd');
-    await app.sessionManager.startSession(s, false);
-    const choiceId = s.quizSnapshot.questions[0]!.choices[0]!.id;
-    expect((await app.sessionManager.submitAnswer(s, participant, 0, { choiceId })).ok).toBe(true);
-
-    // Deleted while still running: the route ends it, records the answered question, then deletes.
-    const gone = await app.inject({
-      method: 'DELETE',
-      url: `/api/v1/sessions/${sessionId}`,
-      cookies: cookiesObject(cookies),
-    });
-    expect(gone.statusCode).toBe(204);
-    expect(await app.prisma.answer.count({ where: { sessionId } })).toBe(0);
-
     const [played, unplayed] = quiz.questions as [
       (typeof quiz.questions)[number],
       (typeof quiz.questions)[number],
     ];
-    const flipped = [
-      mcq({
-        id: played.id,
-        choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
-      }),
-      numeric({ id: unplayed.id }),
-    ];
-    const res = await app.inject({
-      method: 'PUT',
-      url: `/api/v1/quizzes/${quiz.id}/questions`,
-      cookies: cookiesObject(cookies),
-      payload: { questions: flipped },
-    });
-    expect(res.statusCode).toBe(423);
-    expect(res.json().error.code).toBe('QUIZ_LOCKED');
-    expect(res.json().error.details).toEqual({ questionId: played.id, reason: 'correct answer changed' });
-    const detail = await app.inject({
-      method: 'GET',
-      url: `/api/v1/quizzes/${quiz.id}`,
-      cookies: cookiesObject(cookies),
-    });
-    expect(detail.json().quiz.isLocked).toBe(true);
+    // Two sessions both answer the first question; each is ended before the next one opens.
+    const sessionIds: string[] = [];
+    for (const nickname of ['Rgpd', 'Rgpd2']) {
+      const { sessionId, code, s } = await createLiveSession(quiz.id);
+      const { participant } = await joinAs(code, nickname);
+      await app.sessionManager.startSession(s, false);
+      const choiceId = s.quizSnapshot.questions[0]!.choices[0]!.id;
+      expect((await app.sessionManager.submitAnswer(s, participant, 0, { choiceId })).ok).toBe(true);
+      await app.sessionManager.endSession(s);
+      sessionIds.push(sessionId);
+    }
+    const flip = () =>
+      app.inject({
+        method: 'PUT',
+        url: `/api/v1/quizzes/${quiz.id}/questions`,
+        cookies: cookiesObject(cookies),
+        payload: {
+          questions: [
+            mcq({
+              id: played.id,
+              choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
+            }),
+            numeric({ id: unplayed.id }),
+          ],
+        },
+      });
+    const isLocked = async () =>
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/api/v1/quizzes/${quiz.id}`,
+          cookies: cookiesObject(cookies),
+        })
+      ).json().quiz.isLocked as boolean;
+    const deleteSession = async (sessionId: string) => {
+      const gone = await app.inject({
+        method: 'DELETE',
+        url: `/api/v1/sessions/${sessionId}`,
+        cookies: cookiesObject(cookies),
+      });
+      expect(gone.statusCode).toBe(204);
+    };
 
-    // The question never answered is still editable next to the unchanged played one.
-    const editUnplayed = await app.inject({
-      method: 'PUT',
-      url: `/api/v1/quizzes/${quiz.id}/questions`,
-      cookies: cookiesObject(cookies),
-      payload: {
-        questions: [
-          mcq({
-            id: played.id,
-            choices: played.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: c.isCorrect })),
-          }),
-          numeric({ id: unplayed.id, prompt: 'Combien, vraiment ?' }),
-        ],
-      },
-    });
-    expect(editUnplayed.statusCode).toBe(200);
+    // One session deleted: the other one still holds answers to the question.
+    await deleteSession(sessionIds[0]!);
+    const locked = await flip();
+    expect(locked.statusCode).toBe(423);
+    expect(locked.json().error.details).toEqual({ questionId: played.id, reason: 'correct answer changed' });
+    expect(await isLocked()).toBe(true);
 
-    // The duplicate is a fresh, unplayed quiz: the same change goes through there.
-    const dup = await app.inject({
-      method: 'POST',
-      url: `/api/v1/quizzes/${quiz.id}/duplicate`,
-      cookies: cookiesObject(cookies),
-    });
-    expect(dup.statusCode).toBe(201);
-    const copyId = dup.json().quiz.id as string;
-    const copy = await app.inject({
-      method: 'GET',
-      url: `/api/v1/quizzes/${copyId}`,
-      cookies: cookiesObject(cookies),
-    });
-    expect(copy.json().quiz.isLocked).toBe(false);
-    const [copyPlayed, copyUnplayed] = copy.json().quiz.questions as Array<{
-      id: string;
-      choices: Array<{ id: string; label: string; isCorrect: boolean }>;
-    }>;
-    const copyFlip = await app.inject({
-      method: 'PUT',
-      url: `/api/v1/quizzes/${copyId}/questions`,
-      cookies: cookiesObject(cookies),
-      payload: {
-        questions: [
-          mcq({
-            id: copyPlayed!.id,
-            choices: copyPlayed!.choices.map((c) => ({ id: c.id, label: c.label, isCorrect: !c.isCorrect })),
-          }),
-          numeric({ id: copyUnplayed!.id }),
-        ],
-      },
-    });
-    expect(copyFlip.statusCode).toBe(200);
+    // Last session deleted: its answers cascade away and nothing is left to protect.
+    await deleteSession(sessionIds[1]!);
+    expect(await app.prisma.answer.count({ where: { sessionId: { in: sessionIds } } })).toBe(0);
+    expect(await isLocked()).toBe(false);
+    expect((await flip()).statusCode).toBe(200);
   });
 
   it('the lock is re-asserted inside the save transaction (a session created mid-save wins)', async () => {

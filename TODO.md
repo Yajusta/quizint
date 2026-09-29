@@ -2,11 +2,9 @@
 
 ## Bugs
 
-- [ ]
-
 ## Features
 
-- [ ]
+- [ ] Ajouter une explication (optionnelle) à la réponse, qui s'affiche en même temps que la réponse.
 
 ## Tech
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3 (2026-09-29)
+
+A played quiz becomes editable again once all of its sessions are deleted. One new migration (`20260929090000_drop_quiz_played_question_ids`) drops `Quiz.playedQuestionIds`: quizzes locked only by sessions deleted before the deploy unlock at once.
+
+- Quizzes: a question is locked (`423 QUIZ_LOCKED`) while a session that answered it still exists, or while a session that is not over runs on the quiz. Deleting a session deletes its answers, so deleting the last session that answered a question unlocks it; the lock no longer outlives the sessions (reverts the 0.1.1 behaviour). Duplication is still the way to change a question that remaining sessions answered.
+- Web: the stage's question result screen shows the question across the full width, then the answers stacked on the left and the top 5 on the right.
+
 ## 0.1.2 (2026-09-27)
 
 Account roles. One new migration (`20260927160759_account_roles`): every existing account, deactivated ones included, becomes `ADMIN`; demote the ones that should be `USER` after deploy.

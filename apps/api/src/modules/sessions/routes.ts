@@ -20,7 +20,6 @@ import type { Env } from '../../config.js';
 import { asMediaKind, asPhase, asQuestionType } from '../../db/enums.js';
 import { apiError, joinUrl, slugify, validationError } from '../../lib/api.js';
 import { REQUEST_TX_OPTIONS } from '../../plugins/prisma.js';
-import { storedPlayedQuestionIds } from '../quizzes/played.js';
 import { buildAnswersCsv, buildScoresCsv } from './csv.js';
 
 function generateSessionCode(): string {
@@ -67,28 +66,6 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
       where: { id: sessionId, presenterId: adminId },
       select: { id: true, quizId: true, phase: true },
     });
-
-  /**
-   * Adds the questions answered in this session to `Quiz.playedQuestionIds`. Read-modify-write in
-   * one transaction: two sessions of the same quiz deleted together must not drop each other's ids.
-   */
-  const recordPlayedQuestions = async (session: { id: string; quizId: string }): Promise<void> => {
-    const answered = await app.prisma.answer.findMany({
-      where: { sessionId: session.id },
-      select: { questionId: true },
-      distinct: ['questionId'],
-    });
-    if (answered.length === 0) return;
-    const { quizId } = session;
-    await app.prisma.$transaction(async (tx) => {
-      const quiz = await tx.quiz.findUnique({ where: { id: quizId }, select: { playedQuestionIds: true } });
-      if (!quiz) return;
-      const stored = storedPlayedQuestionIds(quiz.playedQuestionIds);
-      const merged = [...new Set([...stored, ...answered.map((a) => a.questionId)])];
-      if (merged.length === stored.length) return;
-      await tx.quiz.update({ where: { id: quizId }, data: { playedQuestionIds: merged } });
-    }, REQUEST_TX_OPTIONS);
-  };
 
   const toSnapshotMedia = (
     m: {
@@ -471,15 +448,12 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
     async (req, reply) => {
       const session = await getOwnedSession(req.params.id, req.adminId!);
       if (!session) return reply.status(404).send(apiError('NOT_FOUND'));
-      // End it first, through the live engine: once ENDED no answer can land any more, so the
-      // answered set read below is final.
+      // End it first, through the live engine: once ENDED no answer can land any more.
       if (session.phase !== 'ENDED') {
         const live = await app.sessionManager.getOrLoad(session.id);
         if (live) await app.sessionManager.endSession(live);
       }
-      // The answers cascade away with the session; the questions they were given to stay played
-      // (QUIZ_LOCKED), so they are recorded on the quiz before the delete.
-      await recordPlayedQuestions(session);
+      // The answers cascade away with the session: questions no remaining session answered unlock.
       await app.sessionManager.deleteSession(session.id);
       return reply.status(204).send();
     },
