@@ -4,19 +4,20 @@ import { FIXTURE_QUIZ_SNAPSHOT } from './fixtures.js';
 import { answeredInOrder, buildQuizSnapshot, toParticipantQuestionView } from '../src/projections.js';
 import type { QuizForSnapshot } from '../src/projections.js';
 
-// §6.3 / §10 — automatic leak test: no isCorrect / numericAnswer / correctAnswer key
+// §6.3 / §10 — automatic leak test: no isCorrect / numericAnswer / correctAnswer / explanation key
 // may appear in any participant payload emitted BEFORE closure.
 function assertNoLeak(payload: unknown, path = 'payload') {
   const json = JSON.stringify(payload);
   expect(json, `leak in ${path}`).not.toContain('isCorrect');
   expect(json, `leak in ${path}`).not.toContain('numericAnswer');
   expect(json, `leak in ${path}`).not.toContain('correctAnswer');
+  expect(json, `leak in ${path}`).not.toContain('explanation');
 }
 
 describe('toParticipantQuestionView — leak prevention', () => {
   for (const q of FIXTURE_QUIZ_SNAPSHOT.questions) {
     it(`strips the answer from question ${q.position} (${q.type})`, () => {
-      const view = toParticipantQuestionView(q);
+      const view = toParticipantQuestionView({ ...q, explanation: 'Parce que.' });
       assertNoLeak(view, `question ${q.position}`);
     });
   }
@@ -79,6 +80,7 @@ describe('buildQuizSnapshot', () => {
         position: 1,
         type: 'MCQ',
         prompt: 'Q',
+        explanation: 'Parce que.',
         mediaOnParticipants: true,
         pointsCorrect: 100,
         pointsWrong: 0,
@@ -108,6 +110,7 @@ describe('buildQuizSnapshot', () => {
         position: 0,
         type: 'NUMERIC',
         prompt: 'N',
+        explanation: null,
         mediaOnParticipants: true,
         pointsCorrect: 50,
         pointsWrong: 0,
@@ -125,6 +128,10 @@ describe('buildQuizSnapshot', () => {
     // questions sorted by position: q2 (position 0) first, then q1 (media).
     expect(snap.questions[1]?.media?.url).toBe('https://quiz.example.fr/uploads/abc.webp');
     expect(snap.snapshotAt).toBe('2026-01-01T00:00:00.000Z');
+  });
+  it('freezes the explanation', () => {
+    const snap = buildQuizSnapshot(quiz, 'https://x.fr');
+    expect(snap.questions.map((q) => q.explanation)).toEqual([null, 'Parce que.']);
   });
   it('sorts questions by position', () => {
     const snap = buildQuizSnapshot(quiz, 'https://x.fr');

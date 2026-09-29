@@ -34,6 +34,8 @@ export const TEXT_ANSWER_MAX_LENGTH = 80; // free text typed for a TEXT_POLL ans
 export const ANSWERS_PAGE_SIZE_MAX = 200; // GET /sessions/:id/answers
 
 export const PROMPT_MAX_LENGTH = 500;
+/** Optional explanation of a question, shown once it is closed (stage and phones). */
+export const EXPLANATION_MAX_LENGTH = 1000;
 export const CHOICE_LABEL_MAX_LENGTH = 120;
 export const CHOICES_MIN = 2;
 export const CHOICES_MAX = 6;

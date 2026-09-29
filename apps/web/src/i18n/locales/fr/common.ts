@@ -76,6 +76,9 @@ export default {
     errorGeneric: 'Envoi impossible, réessayez.',
   },
 
+  explanation: {
+    label: 'Explication',
+  },
   textAnswers: {
     empty: 'Aucune réponse',
     listLabel: 'Réponses des participants',

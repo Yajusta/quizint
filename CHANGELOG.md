@@ -2,10 +2,12 @@
 
 ## 0.1.3 (2026-09-29)
 
-A played quiz becomes editable again once all of its sessions are deleted. One new migration (`20260929090000_drop_quiz_played_question_ids`) drops `Quiz.playedQuestionIds`: quizzes locked only by sessions deleted before the deploy unlock at once.
+A played quiz becomes editable again once all of its sessions are deleted, and questions can carry an explanation revealed with the answer. One new migration (`20260929090000_drop_quiz_played_question_ids`) drops `Quiz.playedQuestionIds`: quizzes locked only by sessions deleted before the deploy unlock at once. A second one (`20260929120000_question_explanation`) adds the nullable `Question.explanation`; existing questions have none.
 
 - Quizzes: a question is locked (`423 QUIZ_LOCKED`) while a session that answered it still exists, or while a session that is not over runs on the quiz. Deleting a session deletes its answers, so deleting the last session that answered a question unlocks it; the lock no longer outlives the sessions (reverts the 0.1.1 behaviour). Duplication is still the way to change a question that remaining sessions answered.
 - Web: the stage's question result screen shows the question across the full width, then the answers stacked on the left and the top 5 on the right.
+- Quizzes: every question can carry an optional explanation (plain text, 1000 characters, line breaks kept), edited under the answers in the editor, exported and imported with the quiz. It does not score, so it stays editable once the question is played; a running session keeps the version of its snapshot.
+- Live: the explanation is revealed with the answer — in `question:closed` and the snapshot's `roundResult`, for the stage and for each participant — never with the open question. It is shown as a panel holding the text alone, with no visible heading (assistive tech still announces it as "Explanation"): full width under the answers and the top 5 on the stage, under the score and rank on the phone. A session started before the deploy shows none.
 
 ## 0.1.2 (2026-09-27)
 

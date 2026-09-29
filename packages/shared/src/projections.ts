@@ -12,7 +12,8 @@ import type {
 /**
  * Strip `choices[].isCorrect` and `numericAnswer` from a snapshot question, and
  * hide the media URL when mediaOnParticipants is false (replaced by { kind, hidden: true }).
- * This is THE leak-prevention boundary for participants before closure (§2.4 rule 2).
+ * This is THE leak-prevention boundary for participants before closure (§2.4 rule 2). The
+ * explanation stays out too: it may give the answer away, and only the round results carry it.
  */
 export function toParticipantQuestionView(q: SnapshotQuestion): ParticipantQuestionView {
   return {
@@ -44,6 +45,7 @@ export interface QuizForSnapshot {
     position: number;
     type: QuestionType;
     prompt: string;
+    explanation: string | null;
     mediaOnParticipants: boolean;
     pointsCorrect: number;
     pointsWrong: number;
@@ -107,6 +109,7 @@ export function buildQuizSnapshot(quiz: QuizForSnapshot, publicUrl: string, now 
         position: q.position,
         type: q.type,
         prompt: q.prompt,
+        explanation: q.explanation,
         media: toSnapshotMedia(publicUrl, q.media),
         mediaOnParticipants: q.mediaOnParticipants,
         pointsCorrect: q.pointsCorrect,

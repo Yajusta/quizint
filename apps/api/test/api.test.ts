@@ -2452,6 +2452,49 @@ describe('live engine', () => {
     expect(put.statusCode).toBe(200);
   });
 
+  it('an explanation is stored, exported, kept out of the open question and revealed at close', async () => {
+    const quiz = await createQuiz('Quiz explication', [
+      mcq({ explanation: '  Paris est la capitale\ndepuis 987.  ' }),
+      mcq({ explanation: '   ' }),
+    ]);
+    expect(quiz.questions.map((q) => q.explanation)).toEqual(['Paris est la capitale\ndepuis 987.', null]);
+
+    const tooLong = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/quizzes/${quiz.id}/questions`,
+      cookies: cookiesObject(cookies),
+      payload: { questions: [mcq({ explanation: 'x'.repeat(1001) })] },
+    });
+    expect(tooLong.statusCode).toBe(400);
+
+    const exported = await app.inject({
+      method: 'GET',
+      url: `/api/v1/quizzes/${quiz.id}/export`,
+      cookies: cookiesObject(cookies),
+    });
+    expect(exported.json().questions[0].explanation).toBe('Paris est la capitale\ndepuis 987.');
+
+    const { code, s } = await createLiveSession(quiz.id);
+    const { participant } = await joinAs(code, 'Inès');
+    await app.sessionManager.startSession(s, false);
+    const open = await app.sessionManager.participantSnapshot(s, participant);
+    expect(JSON.stringify(open)).not.toContain('explanation');
+
+    await app.sessionManager.closeQuestionCommand(s, 0);
+    expect((await app.sessionManager.presenterSnapshot(s)).roundResult?.explanation).toBe(
+      'Paris est la capitale\ndepuis 987.',
+    );
+    expect((await app.sessionManager.participantSnapshot(s, participant)).roundResult?.explanation).toBe(
+      'Paris est la capitale\ndepuis 987.',
+    );
+
+    // A snapshot frozen before the field existed has no key: the result says null, not undefined.
+    await app.sessionManager.nextQuestion(s, 0);
+    delete (s.quizSnapshot.questions[1] as { explanation?: string | null }).explanation;
+    await app.sessionManager.closeQuestionCommand(s, 1);
+    expect((await app.sessionManager.presenterSnapshot(s)).roundResult?.explanation).toBeNull();
+  });
+
   it('closing a question re-sends the participants list with the updated scores', async () => {
     const quiz = await createQuiz('Quiz scores panneau', [mcq()]);
     const { code, s } = await createLiveSession(quiz.id);

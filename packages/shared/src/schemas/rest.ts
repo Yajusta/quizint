@@ -122,6 +122,7 @@ export const QuestionDTO = z.object({
   position: z.number().int(),
   type: QuestionType,
   prompt: z.string(),
+  explanation: z.string().nullable(),
   mediaId: z.string().uuid().nullable(),
   media: ChoiceDTO.shape.media,
   mediaOnParticipants: z.boolean(),

@@ -122,6 +122,7 @@ export async function sessionRoutes(app: FastifyInstance): Promise<void> {
               position: q.position,
               type: asQuestionType(q.type),
               prompt: q.prompt,
+              explanation: q.explanation,
               mediaOnParticipants: q.mediaOnParticipants,
               pointsCorrect: q.pointsCorrect,
               pointsWrong: q.pointsWrong,

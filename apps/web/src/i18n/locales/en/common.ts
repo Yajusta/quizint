@@ -71,6 +71,9 @@ export default {
     errorGeneric: 'Could not send, please try again.',
   },
 
+  explanation: {
+    label: 'Explanation',
+  },
   textAnswers: {
     empty: 'No answer',
     listLabel: 'Participants’ answers',

@@ -101,6 +101,8 @@ export const QuestionResultView = z.object({
   fastestCorrect: FastestCorrectPayload.nullable(),
   top5: z.array(Top5Entry),
   previousRanks: z.record(z.string(), z.number().int()),
+  /** The question's explanation, revealed with the answer. Null when the author wrote none. */
+  explanation: z.string().nullable(),
 });
 export type QuestionResultView = z.infer<typeof QuestionResultView>;
 
@@ -117,6 +119,8 @@ export const ParticipantRoundResult = z.object({
   participantCount: z.number().int(),
   /** TEXT_POLL only: the anonymous grouped answers, as the stage shows them. Null otherwise. */
   textEntries: z.array(TextDistEntry).nullable(),
+  /** Same explanation as the stage's, revealed with the answer. */
+  explanation: z.string().nullable(),
 });
 export type ParticipantRoundResult = z.infer<typeof ParticipantRoundResult>;
 

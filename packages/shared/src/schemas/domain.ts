@@ -2,6 +2,7 @@ import { z } from 'zod';
 
 import {
   CHOICE_LABEL_MAX_LENGTH,
+  EXPLANATION_MAX_LENGTH,
   CHOICES_MAX,
   CHOICES_MIN,
   NICKNAME_MAX_LENGTH,
@@ -88,6 +89,12 @@ export const ChoiceInput = z.object({
   isCorrect: z.boolean().default(false),
 });
 export type ChoiceInput = z.infer<typeof ChoiceInput>;
+
+/**
+ * Optional explanation shown once the question is closed. Revealed with the answer, so it never goes
+ * into `ParticipantQuestionView`: it travels in the round results only. Blank is stored as null.
+ */
+const Explanation = z.string().trim().max(EXPLANATION_MAX_LENGTH).nullable().default(null);
 
 interface QuestionShape {
   type: z.infer<typeof QuestionType>;
@@ -198,6 +205,7 @@ export const QuestionInput = z
     id: z.string().uuid().optional(), // absent = nouvelle question
     type: QuestionType,
     prompt: z.string().trim().min(1).max(PROMPT_MAX_LENGTH),
+    explanation: Explanation,
     mediaId: z.string().uuid().nullable().default(null),
     mediaOnParticipants: z.boolean().default(true),
     pointsCorrect: z.number().int().min(POINTS_MIN).max(POINTS_MAX).default(100),
@@ -244,6 +252,7 @@ export const QuizExportQuestion = z
   .object({
     type: QuestionType,
     prompt: z.string().trim().min(1).max(PROMPT_MAX_LENGTH),
+    explanation: Explanation,
     media: ExportMedia.nullable().default(null),
     mediaOnParticipants: z.boolean().default(true),
     pointsCorrect: z.number().int().min(POINTS_MIN).max(POINTS_MAX).default(100),
@@ -313,6 +322,8 @@ export const SnapshotQuestion = z.object({
   position: z.number().int(),
   type: QuestionType,
   prompt: z.string(),
+  /** Absent from snapshots frozen before the field existed: read it as `explanation ?? null`. */
+  explanation: z.string().nullable(),
   media: SnapshotMedia.nullable(),
   mediaOnParticipants: z.boolean(),
   pointsCorrect: z.number().int(),

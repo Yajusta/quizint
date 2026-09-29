@@ -971,6 +971,8 @@ export class SessionManager {
       ? { participantId: fastest.p.id, nickname: fastest.p.nickname, elapsedMs: fastest.a.elapsedMs }
       : null;
     const correctAnswer = correctAnswerFor(q);
+    // A snapshot frozen before the explanation existed has no such key.
+    const explanation = q.explanation ?? null;
 
     const ranking = this.cachedRanking(s);
     const rankOf = new Map(ranking.map((r) => [r.participantId, r.rank]));
@@ -1002,6 +1004,7 @@ export class SessionManager {
         fastestCorrect,
         top5: ranking.slice(0, INTERMEDIATE_RANKING_SIZE).map(toRankingEntry),
         previousRanks: Object.fromEntries(rankOf),
+        explanation,
       },
       /** Individualised result of one participant (§6.5 rule 4): never the others' detail. */
       forParticipant: (p: ParticipantState) => {
@@ -1018,6 +1021,7 @@ export class SessionManager {
           rank: rankOf.get(p.id) ?? aliveCount,
           participantCount: aliveCount,
           textEntries,
+          explanation,
         };
       },
     };

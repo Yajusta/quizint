@@ -445,6 +445,7 @@ function closeQuestion(s: MockSession) {
       : null,
     top5: ranking.slice(0, INTERMEDIATE_RANKING_SIZE).map(toRankingEntry),
     previousRanks: Object.fromEntries(ranking.map((r) => [r.participantId, r.rank])),
+    explanation: q.explanation,
   };
   presenterNs
     .to(presenterRoom(s.id))
@@ -466,6 +467,7 @@ function closeQuestion(s: MockSession) {
       rank: participantRank(ranking, p.id),
       participantCount: ranking.length,
       textEntries,
+      explanation: q.explanation,
     };
     for (const sock of sockets.get(p.id) ?? [])
       sock.emit('question:closed', { audience: 'participant', result });

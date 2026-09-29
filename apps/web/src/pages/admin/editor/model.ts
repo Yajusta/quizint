@@ -7,6 +7,7 @@ import {
   CHOICE_LABEL_MAX_LENGTH,
   CHOICES_MAX,
   CHOICES_MIN,
+  EXPLANATION_MAX_LENGTH,
   POINTS_MAX,
   POINTS_MIN,
   PROMPT_MAX_LENGTH,
@@ -38,6 +39,8 @@ export interface EditorQuestion {
   id?: string;
   type: QuestionType;
   prompt: string;
+  /** Shown once the question is closed; empty = none (sent as null). */
+  explanation: string;
   mediaId: string | null;
   mediaUrl: string | null;
   mediaKind: MediaKind | null;
@@ -71,6 +74,7 @@ export function newQuestion(defaults: QuestionDefaults): EditorQuestion {
     key: newKey(),
     type: 'MCQ',
     prompt: '',
+    explanation: '',
     mediaId: null,
     mediaUrl: null,
     mediaKind: null,
@@ -92,6 +96,7 @@ export function fromServerQuestion(q: QuestionDTO, key = newKey()): EditorQuesti
     id: q.id,
     type: q.type,
     prompt: q.prompt,
+    explanation: q.explanation ?? '',
     mediaId: q.mediaId,
     mediaUrl: q.media?.url ?? null,
     mediaKind: q.media?.kind ?? null,
@@ -117,6 +122,7 @@ export function toServerQuestion(q: EditorQuestion): QuestionInputType {
     ...(q.id ? { id: q.id } : {}),
     type: q.type,
     prompt: q.prompt.trim(),
+    explanation: q.explanation.trim() || null,
     mediaId: q.mediaId,
     mediaOnParticipants: q.mediaOnParticipants,
     pointsCorrect: q.pointsCorrect,
@@ -210,7 +216,8 @@ export function switchType(q: EditorQuestion, type: QuestionType, labels: TrueFa
 
 // --- Validation (same rules as the server) -------------------------------------------------
 
-export type IssuePath = 'prompt' | 'choices' | 'numericAnswer' | 'points' | 'timeLimitSec' | 'speedBonusMax';
+export type IssuePath =
+  'prompt' | 'explanation' | 'choices' | 'numericAnswer' | 'points' | 'timeLimitSec' | 'speedBonusMax';
 
 export interface Issue {
   path: IssuePath;
@@ -228,6 +235,9 @@ export function validateQuestion(q: EditorQuestion): Issue[] {
   if (q.prompt.trim().length === 0) push('prompt', 'promptRequired');
   else if (q.prompt.trim().length > PROMPT_MAX_LENGTH) {
     push('prompt', 'promptTooLong', { max: PROMPT_MAX_LENGTH });
+  }
+  if (q.explanation.trim().length > EXPLANATION_MAX_LENGTH) {
+    push('explanation', 'explanationTooLong', { max: EXPLANATION_MAX_LENGTH });
   }
 
   const correct = q.choices.filter((c) => c.isCorrect).length;
@@ -349,7 +359,12 @@ export function readDraft(key: string, adminId: string): Draft | null {
       localStorage.removeItem(key);
       return null;
     }
-    return draft as Draft;
+    // A draft written before the explanation existed has no such key.
+    const questions = (draft.questions as Array<Partial<EditorQuestion>>).map((q) => ({
+      ...q,
+      explanation: q.explanation ?? '',
+    }));
+    return { ...draft, questions } as Draft;
   } catch {
     clearDraft(key);
     return null;

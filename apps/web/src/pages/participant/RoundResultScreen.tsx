@@ -1,5 +1,6 @@
 // QUESTION_CLOSED (plan § 5.1 « Retour ») — the score delta is the n° 1 information: 72 px mono,
-// counted up in 600 ms. Colour appears only here: green / red circle at the reveal.
+// counted up in 600 ms. Colour appears only here: green / red circle at the reveal. The question's
+// explanation, if any, closes the screen under the score and rank.
 
 import type { ReactNode } from 'react';
 import { Trans, useTranslation } from 'react-i18next';
@@ -7,6 +8,7 @@ import { Trans, useTranslation } from 'react-i18next';
 import type { ParticipantRoundResult } from '@quiz/shared';
 
 import { CountUp, Icon, StatTile } from '../../design-system/index.ts';
+import { Explanation } from '../../features/shared-live/Explanation.tsx';
 import { TextAnswerList } from '../../features/shared-live/TextAnswerList.tsx';
 import { formatDelta, formatNumber, formatTolerance, MINUS, NBSP } from '../../lib/format.ts';
 import { Num, StageShell } from './shells.tsx';
@@ -148,6 +150,8 @@ export function RoundResultScreen({ result: r }: RoundResultScreenProps) {
             style={{ textAlign: 'left' }}
           />
         </div>
+
+        {r.explanation && <Explanation text={r.explanation} />}
       </div>
     </StageShell>
   );

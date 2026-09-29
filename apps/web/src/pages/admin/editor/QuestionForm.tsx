@@ -1,7 +1,8 @@
 // Centre pane (plan § 5.3): « Informations » card (description, collapsed once filled), then the
 // question form — type `Tabs`, prompt `Textarea` with auto-height and a 500 counter, propositions
 // (`Radio` + `Input lg` + `IconButton trash-2`, max 6), true/false as two `AnswerOption`, numeric
-// as value / tolerance / `Select` on one line. Validation errors sit under the block concerned.
+// as value / tolerance / `Select` on one line, then the optional explanation (1000 counter, never
+// locked: it does not score). Validation errors sit under the block concerned.
 // Green appears only on the correct answer (`Radio` checked, `AnswerOption state=correct`).
 
 import { useLayoutEffect, useRef } from 'react';
@@ -12,6 +13,7 @@ import {
   CHOICE_LABEL_MAX_LENGTH,
   CHOICE_LETTERS,
   CHOICES_MAX,
+  EXPLANATION_MAX_LENGTH,
   PROMPT_MAX_LENGTH,
   QUIZ_DESCRIPTION_MAX_LENGTH,
   TEXT_ANSWER_MAX_LENGTH,
@@ -124,6 +126,7 @@ export function QuestionForm({ q, index, locked, issues, onChange }: QuestionFor
   const patch = (partial: Partial<EditorQuestion>) => onChange({ ...q, ...partial });
   const setChoices = (choices: EditorChoice[]) => patch({ choices });
   const promptId = `q-prompt-${q.key}`;
+  const explanationId = `q-explanation-${q.key}`;
 
   return (
     <Card style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-7)' }}>
@@ -356,6 +359,27 @@ export function QuestionForm({ q, index, locked, issues, onChange }: QuestionFor
             </div>
           </Block>
         )}
+
+        <Field
+          label={t('editor.explanation')}
+          htmlFor={explanationId}
+          error={issueFor('explanation')}
+          hint={
+            <>
+              {t('editor.explanationHint')} <Num>{formatNumber(q.explanation.length)}</Num>
+              {NBSP}/{NBSP}
+              <Num>{formatNumber(EXPLANATION_MAX_LENGTH)}</Num>
+            </>
+          }
+        >
+          <AutoTextarea
+            id={explanationId}
+            value={q.explanation}
+            error={Boolean(issueFor('explanation'))}
+            placeholder={t('editor.explanationPlaceholder')}
+            onChange={(v) => patch({ explanation: v.slice(0, EXPLANATION_MAX_LENGTH) })}
+          />
+        </Field>
       </div>
     </Card>
   );

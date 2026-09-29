@@ -229,6 +229,7 @@ export default {
   validation: {
     promptRequired: 'L’énoncé est requis.',
     promptTooLong: `L’énoncé dépasse {{max}}${NBSP}caractères.`,
+    explanationTooLong: `L’explication dépasse {{max}}${NBSP}caractères.`,
     choicesTooFew: 'Ajoutez au moins deux propositions.',
     choicesTooMany: `Au plus {{max}}${NBSP}propositions.`,
     choiceLabelRequired: 'Chaque proposition doit avoir un libellé.',
@@ -292,6 +293,9 @@ export default {
     typeLabel: 'Type de question',
     prompt: 'Énoncé',
     promptPlaceholder: 'Posez la question telle que les participants la liront.',
+    explanation: 'Explication',
+    explanationHint: 'Facultative, affichée avec la réponse.',
+    explanationPlaceholder: 'Pourquoi cette réponse ? Une précision, une anecdote, une source.',
     correctAnswer: 'Bonne réponse',
     choices: 'Propositions',
     choicesHintMcq: 'Cochez la bonne réponse.',

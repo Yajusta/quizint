@@ -64,6 +64,7 @@ model Question {
   position            Int // 0-based, unique per quiz
   type                String
   prompt              String // ≤ 500 chars
+  explanation         String? // ≤ 1000 chars, shown once the question is closed
   mediaId             String?
   media               Media?   @relation(fields: [mediaId], references: [id], onDelete: SetNull)
   mediaOnParticipants Boolean  @default(true)

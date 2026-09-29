@@ -1,7 +1,7 @@
 // QUESTION_CLOSED (plan § 5.2) — the signature gesture of the stage (§ 3-2): the distribution bars
 // push in 320 ms, one every 60 ms, from A to F. Green marks the correct tile, everything else is
 // muted; a poll keeps every tile neutral. Numeric: histogram, expected value, median. Free-text poll:
-// the grouped answers, most given first.
+// the grouped answers, most given first. The question's explanation, if any, spans the stage below.
 
 import { useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -24,6 +24,7 @@ import {
   StatTile,
   Switch,
 } from '../../design-system/index.ts';
+import { Explanation } from '../../features/shared-live/Explanation.tsx';
 import { TextAnswerList } from '../../features/shared-live/TextAnswerList.tsx';
 import { formatDelta, formatNumber, formatTolerance, NBSP } from '../../lib/format.ts';
 import { prefersReducedMotion, useMediaQuery } from '../../lib/useMediaQuery.ts';
@@ -134,7 +135,8 @@ export function StageClosed({
           alignItems: 'start',
         }}
       >
-        {/* The question spans the stage; the answers and the top 5 share the row below. */}
+        {/* The question spans the stage; the answers and the top 5 share the row below; the
+            explanation spans the last row. */}
         <div style={{ gridColumn: '1 / -1', minWidth: 0 }}>
           {view ? (
             <QuestionHead view={view} index={index} total={total} compact />
@@ -233,6 +235,12 @@ export function StageClosed({
               ))}
             </div>
           </aside>
+        )}
+
+        {r.explanation && (
+          <div style={{ gridColumn: '1 / -1', minWidth: 0 }}>
+            <Explanation text={r.explanation} size="lg" />
+          </div>
         )}
       </div>
     </StageFrame>

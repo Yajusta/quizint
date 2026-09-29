@@ -179,12 +179,23 @@ test.describe.serial('lot 2 — stage', () => {
     await settle(page, 1200);
     await capture(page, 'fermee-qcm', KEY_VIEWPORTS);
 
-    // Q3 — true/false: no capture.
+    // Q3 — true/false with an explanation: answers + top 5, the explanation full width below.
     await pilot.next(1);
     await waitQuestion(page, Q[2]!);
     for (const [i, b] of bots.entries()) await (i % 3 === 0 ? b.wrong(2, Q[2]!) : b.correct(2, Q[2]!));
+    await mockJson(`/mock/sessions/${session.id}/settings`, {
+      method: 'POST',
+      body: JSON.stringify({ showIntermediateRanking: true }),
+    });
     await pilot.close(2);
     await waitClosed(page);
+    await expect(page.getByRole('region', { name: 'Explication' })).toBeVisible();
+    await settle(page, 1400);
+    await capture(page, 'fermee-avec-explication', KEY_VIEWPORTS);
+    await mockJson(`/mock/sessions/${session.id}/settings`, {
+      method: 'POST',
+      body: JSON.stringify({ showIntermediateRanking: false }),
+    });
 
     // Q4 — numeric: histogram.
     await pilot.next(2);

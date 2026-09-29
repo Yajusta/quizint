@@ -88,6 +88,18 @@
             "minLength": 1,
             "maxLength": 500
           },
+          "explanation": {
+            "default": null,
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "media": {
             "default": null,
             "anyOf": [

@@ -226,6 +226,7 @@ export default {
   validation: {
     promptRequired: 'The prompt is required.',
     promptTooLong: 'The prompt exceeds {{max}} characters.',
+    explanationTooLong: 'The explanation exceeds {{max}} characters.',
     choicesTooFew: 'Add at least two choices.',
     choicesTooMany: 'At most {{max}} choices.',
     choiceLabelRequired: 'Every choice needs a label.',
@@ -290,6 +291,9 @@ export default {
     typeLabel: 'Question type',
     prompt: 'Prompt',
     promptPlaceholder: 'Write the question the way participants will read it.',
+    explanation: 'Explanation',
+    explanationHint: 'Optional, shown with the answer.',
+    explanationPlaceholder: 'Why this answer? A detail, an anecdote, a source.',
     correctAnswer: 'Correct answer',
     choices: 'Choices',
     choicesHintMcq: 'Mark the correct answer.',

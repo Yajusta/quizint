@@ -591,6 +591,12 @@ Full participant snapshot sent on every (re)connection
                   "type": "null"
                 }
               ]
+            },
+            "explanation": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -604,7 +610,8 @@ Full participant snapshot sent on every (re)connection
             "totalScore",
             "rank",
             "participantCount",
-            "textEntries"
+            "textEntries",
+            "explanation"
           ],
           "additionalProperties": false
         },
@@ -826,6 +833,12 @@ Full presenter snapshot sent on every (re)connection
                 },
                 "prompt": {
                   "type": "string"
+                },
+                "explanation": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "media": {
                   "anyOf": [
@@ -1055,6 +1068,7 @@ Full presenter snapshot sent on every (re)connection
                 "position",
                 "type",
                 "prompt",
+                "explanation",
                 "media",
                 "mediaOnParticipants",
                 "pointsCorrect",
@@ -1483,6 +1497,12 @@ Full presenter snapshot sent on every (re)connection
                 "minimum": -9007199254740991,
                 "maximum": 9007199254740991
               }
+            },
+            "explanation": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -1494,7 +1514,8 @@ Full presenter snapshot sent on every (re)connection
             "answers",
             "fastestCorrect",
             "top5",
-            "previousRanks"
+            "previousRanks",
+            "explanation"
           ],
           "additionalProperties": false
         },
@@ -1804,6 +1825,12 @@ On question opening (view depends on audience)
             "prompt": {
               "type": "string"
             },
+            "explanation": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "media": {
               "anyOf": [
                 {
@@ -2032,6 +2059,7 @@ On question opening (view depends on audience)
             "position",
             "type",
             "prompt",
+            "explanation",
             "media",
             "mediaOnParticipants",
             "pointsCorrect",
