@@ -6,6 +6,10 @@
 
 Full-featured live quiz application: authoring back-office, projected presenter screen, participants on mobile. pnpm monorepo, strict TypeScript end-to-end.
 
+## Demo
+
+[Try the demo](https://quizint.yajusta.fr/admin/login)
+
 ## Getting Started (4 commands)
 
 ```bash
